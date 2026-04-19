@@ -1,0 +1,48 @@
+# PowerShell
+*.ps1xml.bak
+
+# Test result artifacts
+TestResults/
+*.trx
+coverage.xml
+*.coverage
+
+# Build output
+bin/
+obj/
+out/
+build/
+
+# Logs and run artifacts
+logs/
+*.log
+error_*.txt
+run_*.log
+
+# Local config overrides
+config/local.*.psd1
+config/*.user.psd1
+
+# SQL artifacts
+*.bak
+*.bacpac
+*.dacpac
+*.trn
+*.mdf
+*.ldf
+*.ndf
+
+# SSIS artifacts
+*.ispac
+
+# Editor / OS
+.vs/
+.vscode/
+*.user
+*.suo
+.DS_Store
+Thumbs.db
+
+# Downloaded binaries
+lib/*.dll
+!lib/.gitkeep

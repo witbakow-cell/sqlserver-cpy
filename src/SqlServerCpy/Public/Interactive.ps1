@@ -1,0 +1,118 @@
+function Start-SqlCpyInteractive {
+<#
+.SYNOPSIS
+    Starts the interactive menu-driven console flow (TUI) for sqlserver-cpy.
+
+.DESCRIPTION
+    Loads configuration, shows the current source/target/DryRun state, and presents
+    a menu of actions. Each action logs its progress to the screen via
+    Write-SqlCpyStep / Write-SqlCpyInfo.
+
+    Any uncaught exception from an action is caught at this level and rendered
+    via Show-SqlCpyErrorScreen, which ends the run gracefully and offers to copy
+    or save the full error. Individual actions do not crash the whole app.
+
+.PARAMETER ConfigPath
+    Optional explicit path to a default config file.
+
+.EXAMPLE
+    Start-SqlCpyInteractive
+
+.NOTES
+    This function is the main entry point used by the root launcher
+    Start-SqlServerCopy.ps1.
+#>
+    [CmdletBinding()]
+    param(
+        [string]$ConfigPath
+    )
+
+    $cfg = if ($ConfigPath) { Get-SqlCpyConfig -DefaultPath $ConfigPath } else { Get-SqlCpyConfig }
+
+    while ($true) {
+        Write-Host ''
+        Write-Host ('=' * 72) -ForegroundColor DarkCyan
+        Write-Host '  sqlserver-cpy  -  interactive console' -ForegroundColor Cyan
+        Write-Host ('=' * 72) -ForegroundColor DarkCyan
+        Write-Host ("  Source : {0}" -f $cfg.SourceServer)
+        Write-Host ("  Target : {0}" -f $cfg.TargetServer)
+        Write-Host ("  DryRun : {0}" -f $cfg.DryRun)
+        Write-Host ''
+        Write-Host '  1) Compare server configuration'
+        Write-Host '  2) Apply (equalize) server configuration'
+        Write-Host '  3) Copy logins'
+        Write-Host '  4) Copy SQL Agent jobs'
+        Write-Host '  5) Copy SSIS catalog (folders, projects, environments)'
+        Write-Host '  6) Copy selected databases (schema-only, no data)'
+        Write-Host '  7) Change source / target / DryRun'
+        Write-Host '  0) Exit'
+        Write-Host ''
+
+        $choice = Read-Host 'Choose an action'
+
+        try {
+            switch ($choice) {
+                '1' {
+                    $diff = Invoke-SqlCpyServerConfigCompare `
+                        -SourceServer   $cfg.SourceServer `
+                        -TargetServer   $cfg.TargetServer `
+                        -ExtendedChecks $cfg.ExtendedServerChecks
+                    if ($diff) { $diff | Format-Table -AutoSize } else { Write-SqlCpyInfo 'No differences.' }
+                }
+                '2' {
+                    Invoke-SqlCpyServerConfigApply `
+                        -SourceServer $cfg.SourceServer `
+                        -TargetServer $cfg.TargetServer `
+                        -DryRun       $cfg.DryRun
+                }
+                '3' {
+                    Invoke-SqlCpyLoginCopy `
+                        -SourceServer $cfg.SourceServer `
+                        -TargetServer $cfg.TargetServer `
+                        -DryRun       $cfg.DryRun
+                }
+                '4' {
+                    Invoke-SqlCpyAgentJobCopy `
+                        -SourceServer $cfg.SourceServer `
+                        -TargetServer $cfg.TargetServer `
+                        -DryRun       $cfg.DryRun
+                }
+                '5' {
+                    Invoke-SqlCpySsisCatalogCopy `
+                        -SourceServer $cfg.SourceServer `
+                        -TargetServer $cfg.TargetServer `
+                        -FolderFilter $cfg.SsisFolders `
+                        -DryRun       $cfg.DryRun
+                }
+                '6' {
+                    $dbs = $cfg.SchemaOnlyDatabaseList
+                    if (-not $dbs -or $dbs.Count -eq 0) {
+                        $entered = Read-Host 'Databases (comma-separated)'
+                        $dbs = $entered -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+                    }
+                    if (-not $dbs) { Write-SqlCpyWarning 'No databases specified.'; continue }
+
+                    Invoke-SqlCpySchemaOnlyDatabaseCopy `
+                        -SourceServer $cfg.SourceServer `
+                        -TargetServer $cfg.TargetServer `
+                        -Databases    $dbs `
+                        -DryRun       $cfg.DryRun
+                }
+                '7' {
+                    $s = Read-Host ("Source [{0}]" -f $cfg.SourceServer)
+                    if ($s) { $cfg.SourceServer = $s }
+                    $t = Read-Host ("Target [{0}]" -f $cfg.TargetServer)
+                    if ($t) { $cfg.TargetServer = $t }
+                    $d = Read-Host ("DryRun [{0}] (y/n)" -f $cfg.DryRun)
+                    if ($d -match '^(?i)y') { $cfg.DryRun = $true }
+                    elseif ($d -match '^(?i)n') { $cfg.DryRun = $false }
+                }
+                '0' { return }
+                default { Write-SqlCpyWarning "Unknown choice: $choice" }
+            }
+        } catch {
+            Show-SqlCpyErrorScreen -ErrorRecord $_
+            return
+        }
+    }
+}

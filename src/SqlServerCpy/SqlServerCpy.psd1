@@ -1,0 +1,43 @@
+@{
+    RootModule        = 'SqlServerCpy.psm1'
+    ModuleVersion     = '0.1.0'
+    GUID              = 'a1f4a0b6-2d3a-4a6e-9f0c-2a8a2b7c9e10'
+    Author            = 'sqlserver-cpy contributors'
+    CompanyName       = 'N/A'
+    Copyright         = ''
+    Description       = 'PowerShell scaffold for moving Microsoft SQL Server assets between machines. Initial scaffold - see README.md.'
+    PowerShellVersion = '5.1'
+
+    # dbatools is the primary engine; SqlServer is the fallback module.
+    # Listed as required so Import-Module surfaces missing deps early.
+    RequiredModules   = @(
+        @{ ModuleName = 'dbatools';  ModuleVersion = '2.1.0'  }
+        @{ ModuleName = 'SqlServer'; ModuleVersion = '22.0.0' }
+    )
+
+    FunctionsToExport = @(
+        'Get-SqlCpyConfig'
+        'Write-SqlCpyStep'
+        'Write-SqlCpyInfo'
+        'Write-SqlCpyWarning'
+        'Write-SqlCpyError'
+        'Show-SqlCpyErrorScreen'
+        'Start-SqlCpyInteractive'
+        'Invoke-SqlCpyServerConfigCompare'
+        'Invoke-SqlCpyServerConfigApply'
+        'Invoke-SqlCpyLoginCopy'
+        'Invoke-SqlCpyAgentJobCopy'
+        'Invoke-SqlCpySsisCatalogCopy'
+        'Invoke-SqlCpySchemaOnlyDatabaseCopy'
+    )
+    CmdletsToExport   = @()
+    VariablesToExport = @()
+    AliasesToExport   = @()
+
+    PrivateData = @{
+        PSData = @{
+            Tags       = @('SQLServer', 'Migration', 'dbatools', 'SSIS', 'Scaffold')
+            ProjectUri = 'https://github.com/witbakow-cell/sqlserver-cpy'
+        }
+    }
+}

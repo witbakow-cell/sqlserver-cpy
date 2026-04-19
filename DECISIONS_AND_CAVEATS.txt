@@ -1,0 +1,89 @@
+sqlserver-cpy - Decisions, Observations, and Caveats
+=====================================================
+
+This file records architectural choices and practical caveats for the project.
+It is intentionally plain text for easy browsing and diffing.
+
+Decisions
+---------
+
+1. Dependency strategy: dbatools-first.
+   - Use dbatools cmdlets as the primary engine for SQL Server automation tasks.
+   - Fall back to the SqlServer PowerShell module where dbatools coverage is
+     incomplete (e.g. parts of SSISDB object management).
+   - Fall back further to SMO / AMO / TOM / ADOMD.NET directly only when neither
+     module exposes the needed surface.
+
+2. UI style: interactive console TUI.
+   - Menu-driven flow started from Start-SqlServerCopy.ps1.
+   - Each action logs progress to the screen.
+   - On uncaught runtime errors the run ends with an error screen rather than a
+     stack trace dump; the user is prompted whether to copy the full error.
+     Clipboard copy uses Set-Clipboard when available; otherwise the full error
+     is written to a timestamped file in the current directory and the path is
+     shown.
+
+3. Safety: DryRun by default.
+   - The default configuration sets DryRun = $true. Public functions that
+     mutate target state are expected to honour this flag and only log the
+     intended action.
+
+4. Scope split across files but not over-engineered.
+   - One file per topic under src/SqlServerCpy/Public/. No private helper
+     sprawl, no nested subfolders, no DI abstractions. A topic may be a
+     single function or a small family.
+
+5. Configuration defaults.
+   - SourceServer = "chbbbid2"
+   - TargetServer = "localhost"
+   - Both overridable via the TUI or a user-local config file.
+
+6. SSAS is a documented planned extension only.
+   - Not implemented in this scaffold. See docs/SSAS_PLANNED.md.
+
+Observations
+------------
+
+- dbatools covers Agent jobs, logins, server configuration compare, and
+  schema scripting cleanly. The scaffold wires these as the primary path.
+- SSIS catalog (SSISDB) object transfer is partially covered by dbatools
+  (Copy-DbaSsisCatalog exists but has historically had edge cases); the
+  SqlServer module's Integration Services provider + MOM-style API is a
+  more reliable fallback for SSIS environments and references. Expect to
+  need both.
+- "Schema-only" database copy is handled by scripting objects from the
+  source (dbatools: Export-DbaScript / Export-DbaDbTableData -SchemaOnly,
+  or SMO Scripter) and applying them to the target. Beware of dependency
+  ordering (schemas before tables, tables before foreign keys, etc.) -
+  prefer the built-in ordering in dbatools' Export-DbaScript where
+  possible.
+- Server configuration compare/equalize should use Copy-DbaSpConfigure /
+  Export-DbaSpConfigure as the baseline and supplement with explicit
+  checks for items that sp_configure does not expose (e.g. tempdb file
+  layout, trace flags, collation).
+
+Caveats
+-------
+
+- This is a scaffold. Functions contain TODO markers where a live SQL
+  Server is required to validate the precise cmdlet invocation, parameter
+  set, and error handling. Do NOT treat the current code as production
+  ready for actual migrations.
+
+- Credentials. The scaffold passes -SqlCredential through to dbatools
+  when provided, but does not manage secret storage. Use Windows auth or
+  a secret manager upstream.
+
+- Idempotency. Not all dbatools copy cmdlets are safely re-runnable.
+  Always run with DryRun first and review planned changes.
+
+- Version drift. dbatools and SqlServer module surfaces change between
+  versions. Pin minimum versions in DEPENDENCIES.md and consider
+  Import-Module -RequiredVersion in production.
+
+- Clipboard on non-Windows hosts / remote sessions: Set-Clipboard may
+  not be available. The error screen falls back to writing a timestamped
+  error file in the current directory.
+
+- Logging is to the screen only by default. If persistent logs are
+  desired, add a Start-Transcript at the top of Start-SqlServerCopy.ps1.
