@@ -12,9 +12,14 @@ function Invoke-SqlCpySchemaOnlyDatabaseCopy {
     for applying the generated script. SMO Scripter is the documented fallback when
     finer control over dependency ordering is needed.
 
-    Connection security parameters flow via Get-SqlCpyConnectionSplat /
-    Get-SqlCpyDbaInstance. Honours the DryRun flag. With DryRun, the function scripts
-    into a temp folder but does not execute the script on the target.
+    Connection security: the source and target handles are obtained via
+    Get-SqlCpyCachedConnection (reusing the preflight connection objects when
+    available), so TrustServerCertificate / EncryptConnection apply even to the
+    Export-DbaScript / Invoke-DbaQuery paths where dbatools does not expose
+    trust flags directly.
+
+    Honours the DryRun flag. With DryRun, the function scripts into a temp
+    folder but does not execute the script on the target.
 
 .PARAMETER SourceServer
     Source SQL Server instance name.
@@ -56,13 +61,14 @@ function Invoke-SqlCpySchemaOnlyDatabaseCopy {
     }
     Write-SqlCpyInfo "Script output folder: $OutputFolder"
 
+    $srcConn = Get-SqlCpyCachedConnection -Config $Config -Role 'Source' -Server $SourceServer -Credential $Config.SourceCredential
+
     foreach ($db in $Databases) {
         Write-SqlCpyInfo "Scripting database: $db"
 
         $scriptPath = Join-Path -Path $OutputFolder -ChildPath ("{0}.sql" -f $db)
 
         try {
-            $srcConn = Get-SqlCpyDbaInstance -Config $Config -Server $SourceServer -Credential $Config.SourceCredential
             Export-DbaScript -InputObject $srcConn.Databases[$db] -FilePath $scriptPath -ScriptingOptionsObject (New-DbaScriptingOption)
         } catch {
             Write-SqlCpyWarning "Scripting for $db used fallback path: $($_.Exception.Message)"
@@ -77,7 +83,8 @@ function Invoke-SqlCpySchemaOnlyDatabaseCopy {
         }
 
         Write-SqlCpyInfo "Applying script to target: $db"
-        $tgtSplat = Get-SqlCpyConnectionSplat -Config $Config -Server $TargetServer -Credential $Config.TargetCredential -CommandName 'Invoke-DbaQuery'
+        $tgtConn = Get-SqlCpyCachedConnection -Config $Config -Role 'Target' -Server $TargetServer -Credential $Config.TargetCredential
+        $tgtSplat = Get-SqlCpyInstanceSplat -Config $Config -Connection $tgtConn -CommandName 'Invoke-DbaQuery'
         Invoke-DbaQuery @tgtSplat -Database $db -File $scriptPath -EnableException
     }
 }

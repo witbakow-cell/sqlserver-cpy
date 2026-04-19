@@ -11,8 +11,12 @@ function Invoke-SqlCpyLoginCopy {
     Honours the DryRun flag. With DryRun the function lists which logins would be
     copied but does not call Copy-DbaLogin.
 
-    Connection security parameters (EncryptConnection, TrustServerCertificate,
-    ConnectionTimeout) flow via Get-SqlCpyConnectionSplat / Get-SqlCpyCopySplat.
+    Connection security: a dbatools connection object opened by
+    Get-SqlCpyCachedConnection carries TrustServerCertificate /
+    EncryptConnection; it is passed as -SqlInstance to Get-DbaLogin and as
+    -Source / -Destination to Copy-DbaLogin. This reuses the preflight
+    connection and avoids "certificate chain ... not trusted" errors on
+    cmdlets that do not expose trust parameters directly.
 
 .PARAMETER SourceServer
     Source SQL Server instance name.
@@ -45,14 +49,17 @@ function Invoke-SqlCpyLoginCopy {
 
     Write-SqlCpyStep "Copying logins: $SourceServer -> $TargetServer (DryRun=$DryRun)"
 
-    $srcSplat = Get-SqlCpyConnectionSplat -Config $Config -Server $SourceServer -Credential $Config.SourceCredential -CommandName 'Get-DbaLogin'
+    $srcConn = Get-SqlCpyCachedConnection -Config $Config -Role 'Source' -Server $SourceServer -Credential $Config.SourceCredential
+    $tgtConn = Get-SqlCpyCachedConnection -Config $Config -Role 'Target' -Server $TargetServer -Credential $Config.TargetCredential
+
+    $srcSplat = Get-SqlCpyInstanceSplat -Config $Config -Connection $srcConn -CommandName 'Get-DbaLogin'
     $logins = Get-DbaLogin @srcSplat |
         Where-Object {
             $_.Name -notlike '##*' -and $_.Name -ne 'sa' -and
             ((-not $LoginFilter) -or ($LoginFilter -contains $_.Name))
         }
 
-    $copySplat = Get-SqlCpyCopySplat -Config $Config -Source $SourceServer -Destination $TargetServer -CommandName 'Copy-DbaLogin'
+    $copySplat = Get-SqlCpyCopySplat -Config $Config -SourceConnection $srcConn -DestinationConnection $tgtConn -CommandName 'Copy-DbaLogin'
 
     foreach ($l in $logins) {
         if ($DryRun) {

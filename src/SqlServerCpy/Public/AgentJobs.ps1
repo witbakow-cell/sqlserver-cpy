@@ -8,8 +8,10 @@ function Invoke-SqlCpyAgentJobCopy {
     schedules, operators, and categories via the related cmdlets when -Force or
     explicit parameters are used.
 
-    Honours the DryRun flag. Connection security parameters flow via
-    Get-SqlCpyConnectionSplat / Get-SqlCpyCopySplat.
+    Honours the DryRun flag. Connection security is carried by pre-built
+    Connect-DbaInstance connection objects (via Get-SqlCpyCachedConnection);
+    TrustServerCertificate / EncryptConnection apply through the connection
+    rather than per-cmdlet flags.
 
 .PARAMETER SourceServer
     Source SQL Server instance name.
@@ -39,11 +41,14 @@ function Invoke-SqlCpyAgentJobCopy {
 
     Write-SqlCpyStep "Copying SQL Agent jobs: $SourceServer -> $TargetServer (DryRun=$DryRun)"
 
-    $srcSplat = Get-SqlCpyConnectionSplat -Config $Config -Server $SourceServer -Credential $Config.SourceCredential -CommandName 'Get-DbaAgentJob'
+    $srcConn = Get-SqlCpyCachedConnection -Config $Config -Role 'Source' -Server $SourceServer -Credential $Config.SourceCredential
+    $tgtConn = Get-SqlCpyCachedConnection -Config $Config -Role 'Target' -Server $TargetServer -Credential $Config.TargetCredential
+
+    $srcSplat = Get-SqlCpyInstanceSplat -Config $Config -Connection $srcConn -CommandName 'Get-DbaAgentJob'
     $jobs = Get-DbaAgentJob @srcSplat |
         Where-Object { (-not $JobFilter) -or ($JobFilter -contains $_.Name) }
 
-    $copySplat = Get-SqlCpyCopySplat -Config $Config -Source $SourceServer -Destination $TargetServer -CommandName 'Copy-DbaAgentJob'
+    $copySplat = Get-SqlCpyCopySplat -Config $Config -SourceConnection $srcConn -DestinationConnection $tgtConn -CommandName 'Copy-DbaAgentJob'
 
     foreach ($j in $jobs) {
         if ($DryRun) {

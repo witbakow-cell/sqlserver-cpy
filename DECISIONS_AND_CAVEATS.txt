@@ -41,18 +41,31 @@ Decisions
 6. SSAS is a documented planned extension only.
    - Not implemented in this scaffold. See docs/SSAS_PLANNED.md.
 
-7. Connection security is centralized, not per-call.
+7. Connection security is centralized, not per-call, and applied via
+   Connect-DbaInstance connection objects (not per-cmdlet flags).
    - Three config keys drive every dbatools call:
        EncryptConnection        (default $true)
        TrustServerCertificate   (default $true)
        ConnectionTimeoutSeconds (default 15)
-   - Public migration functions never build connection arguments inline.
-     They call Get-SqlCpyConnectionSplat (for cmdlets that take -SqlInstance)
-     or Get-SqlCpyCopySplat (for Copy-Dba* cmdlets that take -Source /
-     -Destination) and splat the result. Functions that need an actual
-     connected SMO handle - e.g. Export-DbaScript against a specific
-     database - use Get-SqlCpyDbaInstance, which wraps Connect-DbaInstance
-     with the same settings.
+   - Get-SqlCpyDbaConnection opens a Connect-DbaInstance handle with
+     those settings baked in. Test-SqlCpyPreflight calls it for both
+     source and target and caches the handles on $Config as
+     _SourceConnection / _TargetConnection.
+   - Public migration functions obtain the handles via
+     Get-SqlCpyCachedConnection and pass them through
+     Get-SqlCpyInstanceSplat (for cmdlets that take -SqlInstance) or
+     Get-SqlCpyCopySplat -SourceConnection / -DestinationConnection
+     (for Copy-Dba* cmdlets). This is the only pattern that reliably
+     applies TrustServerCertificate to dbatools 2.x cmdlets that do
+     NOT expose -TrustServerCertificate directly (Get-DbaSpConfigure,
+     Copy-DbaSpConfigure, Copy-DbaLogin, Copy-DbaAgentJob, ...).
+   - The raw-name helpers (Get-SqlCpyConnectionSplat without -Connection,
+     Get-SqlCpyCopySplat with string -Source / -Destination) still exist
+     for Connect-DbaInstance itself and for any future caller that does
+     not need connection-object reuse. They retain dynamic filtering
+     against Get-Command so unsupported parameter names are dropped.
+   - Get-SqlCpyDbaInstance is kept as a back-compat wrapper around
+     Get-SqlCpyDbaConnection.
    - TrustServerCertificate default is $true because this tool is for
      local admin-bootstrap migrations (Windows auth, LAN, self-signed
      server cert). That disables CA/hostname validation and is therefore
@@ -65,6 +78,10 @@ Decisions
      and target under the configured TLS settings and reports actionable
      hints for: missing dbatools, untrusted certificate chain, auth
      failure, network / host unreachable.
+   - On success it stores the opened connection objects on
+     $Config._SourceConnection / $Config._TargetConnection so that
+     Compare / Copy steps reuse the *same* authenticated handle and
+     cannot diverge in trust behaviour.
    - The TUI invokes preflight before every migration action (options
      1-6). This replaces the silent WARN + empty result we previously
      saw from Get-DbaSpConfigure when the certificate was not trusted;
@@ -75,14 +92,40 @@ Observed issue resolved
 -----------------------
 
 - WARNING: [Get-DbaSpConfigure] Failure | The certificate chain was
-  issued by an authority that is not trusted
+  issued by an authority that is not trusted   (STEP 1, chbbbid2)
   Root cause: dbatools -> Microsoft.Data.SqlClient 4.x defaults to
-  Encrypt=Mandatory with strict chain validation. The server (chbbbid2
-  in the default config) presents a self-signed cert that is not in
-  the caller's trust store. Fix shipped here: the centralized splat
-  passes TrustServerCertificate=True by default, and Preflight surfaces
-  a clear diagnostic if the user has flipped it off and the handshake
-  still fails.
+  Encrypt=Mandatory with strict chain validation. Get-DbaSpConfigure
+  in dbatools 2.x does NOT expose -TrustServerCertificate. The splat
+  helper's dynamic filter (added as the fix for the earlier
+  ConnectionTimeout binding error below) therefore correctly dropped
+  -TrustServerCertificate from the Get-DbaSpConfigure call, which also
+  silently dropped trust and reinstated strict chain validation on a
+  server (chbbbid2) with a self-signed / internal-CA cert.
+  Fix shipped here: apply TrustServerCertificate through a pre-built
+  Connect-DbaInstance connection object and pass THAT object as
+  -SqlInstance / -Source / -Destination to downstream cmdlets.
+  dbatools reuses the open connection - trust decision and all - even
+  though the cmdlet itself has no -TrustServerCertificate parameter.
+  Implementation:
+    * Get-SqlCpyDbaConnection opens a Connect-DbaInstance handle with
+      Encrypt/Trust/Timeout applied at the connection level.
+    * Test-SqlCpyPreflight opens both source and target handles this
+      way and caches them on the $Config hashtable under keys
+      _SourceConnection / _TargetConnection.
+    * Get-SqlCpyCachedConnection returns the cached handle (or opens
+      a fresh one on a cache miss) for any caller that wants to run a
+      downstream dbatools cmdlet.
+    * Get-SqlCpyInstanceSplat wraps the handle into a splat for
+      cmdlets that take -SqlInstance (Get-DbaSpConfigure, Get-DbaLogin,
+      Get-DbaAgentJob, Invoke-DbaQuery).
+    * Get-SqlCpyCopySplat now accepts -SourceConnection /
+      -DestinationConnection; when supplied, raw name strings are
+      replaced by the connection objects and trust/encrypt flags are
+      omitted from the emitted splat.
+  Consequence: a successful Preflight is now load-bearing - it
+  guarantees that every subsequent TUI step (Compare server
+  configuration, Copy logins, Copy agent jobs, etc.) uses the exact
+  same TLS/trust decision Preflight validated.
 
 - ERROR: Source connection failed: A parameter cannot be found that
   matches parameter name 'ConnectionTimeout'.
@@ -93,16 +136,13 @@ Observed issue resolved
   Copy-DbaSsisCatalog). Splatting the missing parameter aborted TUI
   action 1 ("Compare server configuration") at preflight.
   Fix shipped here: Get-SqlCpyConnectionSplat and Get-SqlCpyCopySplat
-  now accept -CommandName and filter the returned hashtable against the
+  accept -CommandName and filter the returned hashtable against the
   named command's real parameter set (via Get-Command). If the command
   accepts -ConnectionTimeout, ConnectTimeout, or StatementTimeout the
-  configured value is routed to whichever name is supported; if none is,
-  the timeout is silently skipped for that call. ConnectionTimeoutSeconds
-  remains in config because it is still useful for Connect-DbaInstance
-  and Invoke-DbaQuery, which DO expose it. Callers were updated to pass
-  -CommandName (ServerConfig / Logins / AgentJobs / SchemaOnlyDatabase /
-  SsisCatalog). Get-SqlCpyConnectionErrorHint additionally recognises
-  the parameter-binding error text and prints an actionable hint.
+  configured value is routed to whichever name is supported; if none
+  is, the timeout is silently skipped for that call. That filtering
+  is retained for raw-name calls but is no longer the primary defence
+  against the cert-trust failure above - the connection-object path is.
 
 Observations
 ------------

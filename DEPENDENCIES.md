@@ -67,23 +67,44 @@ trust store. Self-signed or internally issued certs raise:
   the MITM tradeoff and production guidance)
 - `ConnectionTimeoutSeconds` (default `15`)
 
-These are forwarded to every `dbatools` cmdlet through the centralized helpers
-`Get-SqlCpyConnectionSplat` / `Get-SqlCpyCopySplat`. Use the TUI `Preflight` option or
-call `Test-SqlCpyPreflight` directly to validate both endpoints before running migration
-steps.
+These are applied through a `Connect-DbaInstance` connection object
+(`Get-SqlCpyDbaConnection`) that is reused across subsequent `dbatools` calls.
+Use the TUI `Preflight` option or call `Test-SqlCpyPreflight` directly to open
+(and validate) both endpoints before running migration steps; the resulting
+connection objects are cached on the `$Config` hashtable as `_SourceConnection`
+/ `_TargetConnection` and retrieved via `Get-SqlCpyCachedConnection`.
 
 ### dbatools parameter compatibility
 
-Not every `dbatools` cmdlet accepts the same set of connection parameters. For example,
-`-ConnectionTimeout` is exposed on `Connect-DbaInstance` but **not** on
-`Get-DbaSpConfigure`, `Copy-DbaSpConfigure`, `Copy-DbaLogin`, `Copy-DbaAgentJob`, or
-`Copy-DbaSsisCatalog` in the 2.x line. Blindly splatting `-ConnectionTimeout` onto those
-commands fails with:
+Not every `dbatools` cmdlet accepts the same set of connection parameters. In
+the 2.x line:
 
-> `A parameter cannot be found that matches parameter name 'ConnectionTimeout'.`
+- `Connect-DbaInstance`, `Invoke-DbaQuery` accept `-TrustServerCertificate`,
+  `-EncryptConnection`, `-ConnectionTimeout`.
+- `Get-DbaSpConfigure`, `Copy-DbaSpConfigure`, `Get-DbaLogin`, `Copy-DbaLogin`,
+  `Get-DbaAgentJob`, `Copy-DbaAgentJob`, `Copy-DbaSsisCatalog` do **not** expose
+  `-TrustServerCertificate` or `-ConnectionTimeout`. They **do** accept an
+  already-open `Connect-DbaInstance` connection object as `-SqlInstance` /
+  `-Source` / `-Destination`, which carries those settings.
 
-To avoid this, `Get-SqlCpyConnectionSplat` and `Get-SqlCpyCopySplat` now take an optional
-`-CommandName` and introspect that command via `Get-Command`:
+Because of this asymmetry, a version of the scaffold that dynamically filtered
+its splat against `Get-Command` correctly avoided
+`A parameter cannot be found that matches parameter name 'ConnectionTimeout'.`
+but also silently dropped `TrustServerCertificate` on Get-DbaSpConfigure, which
+resurfaced _"The certificate chain was issued by an authority that is not
+trusted"_ on `chbbbid2`.
+
+`sqlserver-cpy` therefore applies `TrustServerCertificate = $true` (and
+`EncryptConnection`, `ConnectionTimeoutSeconds`) through `Connect-DbaInstance`
+**once** via `Get-SqlCpyDbaConnection`. Downstream cmdlets receive that
+connection object via `Get-SqlCpyInstanceSplat` (for `-SqlInstance`) or
+`Get-SqlCpyCopySplat -SourceConnection / -DestinationConnection` (for `-Source`
+/ `-Destination`). When a connection object is in play, trust/encrypt flags are
+omitted from the command-level splat - they are already baked in.
+
+The legacy raw-name helpers (`Get-SqlCpyConnectionSplat`, `Get-SqlCpyCopySplat`
+without connection objects) still work and still take an optional
+`-CommandName` to filter against `Get-Command`:
 
 1. If the command accepts `-ConnectionTimeout`, the configured
    `ConnectionTimeoutSeconds` is forwarded under that name.
@@ -92,9 +113,6 @@ To avoid this, `Get-SqlCpyConnectionSplat` and `Get-SqlCpyCopySplat` now take an
 3. If the command accepts none, the timeout is **silently skipped** for that call.
    Keep `ConnectionTimeoutSeconds` in config — it is still honoured by
    `Connect-DbaInstance` / `Invoke-DbaQuery` and by the preflight check.
-
-The same logic gates `-EncryptConnection` and `-TrustServerCertificate` where a given
-command version does not accept them.
 
 If you find a `dbatools` cmdlet that exposes a timeout under yet another name, add it
 to the `Candidates` list inside `Get-SqlCpyConnectionSplat` (`src/SqlServerCpy/Public/Connection.ps1`)

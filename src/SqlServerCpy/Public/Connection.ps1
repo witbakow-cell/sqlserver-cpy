@@ -88,6 +88,16 @@ function Get-SqlCpyConnectionSplat {
     target command actually supports are included.
 
 .DESCRIPTION
+    Historical helper retained for any caller that still wants to pass a raw
+    server name plus trust/encrypt flags directly to a dbatools cmdlet that
+    exposes those parameters. In practice, the preferred path for commands
+    such as Get-DbaSpConfigure / Get-DbaLogin / Get-DbaAgentJob is to pass a
+    pre-built Connect-DbaInstance connection object as -SqlInstance; see
+    Get-SqlCpyDbaConnection and Get-SqlCpyInstanceSplat. Connection-object
+    reuse is the only pattern that reliably applies TrustServerCertificate to
+    cmdlets that do not expose the parameter directly, which is what broke
+    "Compare server configuration" against chbbbid2.
+
     Centralizes construction of SQL Server connection parameters so migration
     functions do not repeatedly reach into the config hashtable and hand-build
     connection arguments.
@@ -113,7 +123,7 @@ function Get-SqlCpyConnectionSplat {
     Optional PSCredential. If omitted the current Windows identity is used.
 
 .PARAMETER CommandName
-    The dbatools cmdlet the splat will be applied to, e.g. 'Get-DbaSpConfigure'.
+    The dbatools cmdlet the splat will be applied to, e.g. 'Connect-DbaInstance'.
     When supplied, only parameters that command actually accepts are emitted.
 
 .PARAMETER SimulatedParameters
@@ -122,18 +132,13 @@ function Get-SqlCpyConnectionSplat {
 
 .OUTPUTS
     Hashtable for @splatting.
-
-.EXAMPLE
-    $cfg = Get-SqlCpyConfig
-    $splat = Get-SqlCpyConnectionSplat -Config $cfg -Server $cfg.SourceServer -CommandName 'Get-DbaSpConfigure'
-    Get-DbaSpConfigure @splat
 #>
     [CmdletBinding()]
     [OutputType([hashtable])]
     param(
         [Parameter(Mandatory)] [hashtable]$Config,
         [Parameter(Mandatory)] [string]$Server,
-        [System.Management.Automation.PSCredential]$Credential,
+        [AllowNull()] [System.Management.Automation.PSCredential]$Credential,
         [string]$CommandName,
         [string[]]$SimulatedParameters
     )
@@ -145,8 +150,6 @@ function Get-SqlCpyConnectionSplat {
         $paramSet = Get-SqlCpyCommandParameter -Name $CommandName
     }
 
-    # Canonical parameter-name we'd like to emit -> list of names accepted as
-    # equivalents in various dbatools versions (priority order).
     $wanted = @(
         @{ Key = 'SqlInstance';            Candidates = @('SqlInstance') }
         @{ Key = 'SqlCredential';          Candidates = @('SqlCredential') }
@@ -184,11 +187,6 @@ function Get-SqlCpyConnectionSplat {
                     if ($paramSet) {
                         $resolved = Resolve-SqlCpyParameterName -ParameterSet $paramSet -Candidates $w.Candidates
                         if ($resolved) { $splat[$resolved] = [int]$Config.ConnectionTimeoutSeconds }
-                        # If the command doesn't accept a timeout parameter, we silently skip it.
-                    } else {
-                        # Unknown command: skip timeout entirely to avoid the
-                        # "A parameter cannot be found that matches parameter name 'ConnectionTimeout'"
-                        # failure. Callers that need it must pass -CommandName.
                     }
                 }
             }
@@ -210,6 +208,14 @@ function Get-SqlCpyCopySplat {
     Copy-DbaAgentJob, Copy-DbaSsisCatalog, Copy-DbaSpConfigure are the common
     callers.
 
+    NOTE: Copy-Dba* cmdlets accept already-open dbatools connection objects
+    for -Source / -Destination, and that is now the preferred path because
+    TrustServerCertificate is applied via Connect-DbaInstance once and then
+    reused. Pass pre-built connection objects via -SourceConnection /
+    -DestinationConnection; when supplied, trust/encrypt flags are omitted
+    from the returned splat (they are already baked into the connection) and
+    raw name strings are replaced with the connection objects themselves.
+
     As with the SqlInstance helper, pass -CommandName so unsupported parameter
     names (most notably -ConnectionTimeout) are filtered out.
 
@@ -217,10 +223,19 @@ function Get-SqlCpyCopySplat {
     Config hashtable.
 
 .PARAMETER Source
-    Source SQL Server instance name.
+    Source SQL Server instance name. Ignored when -SourceConnection is given.
 
 .PARAMETER Destination
-    Target SQL Server instance name.
+    Target SQL Server instance name. Ignored when -DestinationConnection is given.
+
+.PARAMETER SourceConnection
+    Optional pre-built dbatools connection object for the source. Produced by
+    Get-SqlCpyDbaConnection / Connect-DbaInstance. When present, takes precedence
+    over -Source and carries the TrustServerCertificate / EncryptConnection
+    settings.
+
+.PARAMETER DestinationConnection
+    Optional pre-built dbatools connection object for the destination.
 
 .PARAMETER CommandName
     dbatools cmdlet the splat will be applied to.
@@ -235,8 +250,10 @@ function Get-SqlCpyCopySplat {
     [OutputType([hashtable])]
     param(
         [Parameter(Mandatory)] [hashtable]$Config,
-        [Parameter(Mandatory)] [string]$Source,
-        [Parameter(Mandatory)] [string]$Destination,
+        [string]$Source,
+        [string]$Destination,
+        $SourceConnection,
+        $DestinationConnection,
         [string]$CommandName,
         [string[]]$SimulatedParameters
     )
@@ -248,37 +265,42 @@ function Get-SqlCpyCopySplat {
         $paramSet = Get-SqlCpyCommandParameter -Name $CommandName
     }
 
+    $useSrcConn = $null -ne $SourceConnection
+    $useDstConn = $null -ne $DestinationConnection
+
     $splat = @{
-        Source      = $Source
-        Destination = $Destination
+        Source      = if ($useSrcConn) { $SourceConnection } else { $Source }
+        Destination = if ($useDstConn) { $DestinationConnection } else { $Destination }
     }
 
-    if ($Config.ContainsKey('EncryptConnection')) {
-        if (-not $paramSet -or $paramSet.ContainsKey('EncryptConnection')) {
-            $splat['EncryptConnection'] = [bool]$Config.EncryptConnection
+    if (-not $useSrcConn -or -not $useDstConn) {
+        # Only emit trust/encrypt flags when at least one side is still a raw
+        # name; once both sides are connection objects, their internal flags
+        # win and the command-level flags are either redundant or rejected.
+        if ($Config.ContainsKey('EncryptConnection')) {
+            if (-not $paramSet -or $paramSet.ContainsKey('EncryptConnection')) {
+                $splat['EncryptConnection'] = [bool]$Config.EncryptConnection
+            }
+        }
+        if ($Config.ContainsKey('TrustServerCertificate')) {
+            if (-not $paramSet -or $paramSet.ContainsKey('TrustServerCertificate')) {
+                $splat['TrustServerCertificate'] = [bool]$Config.TrustServerCertificate
+            }
         }
     }
-    if ($Config.ContainsKey('TrustServerCertificate')) {
-        if (-not $paramSet -or $paramSet.ContainsKey('TrustServerCertificate')) {
-            $splat['TrustServerCertificate'] = [bool]$Config.TrustServerCertificate
-        }
-    }
+
     if ($Config.ContainsKey('ConnectionTimeoutSeconds') -and $Config.ConnectionTimeoutSeconds) {
         if ($paramSet) {
             $resolved = Resolve-SqlCpyParameterName -ParameterSet $paramSet -Candidates @('ConnectionTimeout','ConnectTimeout','StatementTimeout')
             if ($resolved) { $splat[$resolved] = [int]$Config.ConnectionTimeoutSeconds }
-            # If the Copy-Dba* cmdlet doesn't expose any timeout parameter (the
-            # common case in dbatools 2.x), we silently skip it rather than
-            # crash the migration with a parameter-binding error.
         }
-        # Unknown command: skip the timeout to stay safe.
     }
-    if ($Config.SourceCredential) {
+    if (-not $useSrcConn -and $Config.SourceCredential) {
         if (-not $paramSet -or $paramSet.ContainsKey('SourceSqlCredential')) {
             $splat['SourceSqlCredential'] = $Config.SourceCredential
         }
     }
-    if ($Config.TargetCredential) {
+    if (-not $useDstConn -and $Config.TargetCredential) {
         if (-not $paramSet -or $paramSet.ContainsKey('DestinationSqlCredential')) {
             $splat['DestinationSqlCredential'] = $Config.TargetCredential
         }
@@ -287,16 +309,34 @@ function Get-SqlCpyCopySplat {
     return $splat
 }
 
-function Get-SqlCpyDbaInstance {
+function Get-SqlCpyDbaConnection {
 <#
 .SYNOPSIS
-    Opens a dbatools SMO connection honouring the project's connection-security
-    configuration.
+    Opens a dbatools SMO connection (Connect-DbaInstance) with the project's
+    connection-security configuration baked in, and returns the connection
+    object for reuse across downstream dbatools cmdlets.
 
 .DESCRIPTION
-    Uses Connect-DbaInstance under the hood. Connect-DbaInstance accepts
-    -ConnectionTimeout on all supported dbatools versions so we splat through
-    that command name explicitly.
+    This is the single entry point the rest of the module should use to
+    obtain an authenticated dbatools handle for a given server. The returned
+    object captures TrustServerCertificate / EncryptConnection /
+    ConnectionTimeout at the connection level, so when it is passed as
+    -SqlInstance (or -Source / -Destination) to commands such as
+    Get-DbaSpConfigure, Get-DbaLogin, Get-DbaAgentJob, or Copy-Dba* - which
+    do NOT expose -TrustServerCertificate themselves in dbatools 2.x - the
+    trust decision still applies because they reuse this connection.
+
+    That is the fix for the observed failure:
+
+        WARNING: [Get-DbaSpConfigure] Failure | The certificate chain was
+        issued by an authority that is not trusted
+
+    against chbbbid2 on "Compare server configuration". The previous fix
+    filtered splat parameters against the target cmdlet, which correctly
+    avoided a parameter-binding error but also dropped TrustServerCertificate
+    because Get-DbaSpConfigure does not expose it. Passing a pre-built
+    connection object instead routes trust through Connect-DbaInstance, which
+    does expose it.
 
 .PARAMETER Config
     Config hashtable as produced by Get-SqlCpyConfig.
@@ -311,7 +351,7 @@ function Get-SqlCpyDbaInstance {
     param(
         [Parameter(Mandatory)] [hashtable]$Config,
         [Parameter(Mandatory)] [string]$Server,
-        [System.Management.Automation.PSCredential]$Credential
+        [AllowNull()] [System.Management.Automation.PSCredential]$Credential
     )
 
     if (-not (Get-Command -Name Connect-DbaInstance -ErrorAction SilentlyContinue)) {
@@ -322,12 +362,99 @@ function Get-SqlCpyDbaInstance {
     return Connect-DbaInstance @splat -ErrorAction Stop
 }
 
+function Get-SqlCpyDbaInstance {
+<#
+.SYNOPSIS
+    Back-compat wrapper. Use Get-SqlCpyDbaConnection for new code.
+#>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [hashtable]$Config,
+        [Parameter(Mandatory)] [string]$Server,
+        [AllowNull()] [System.Management.Automation.PSCredential]$Credential
+    )
+    $pass = @{ Config = $Config; Server = $Server }
+    if ($Credential) { $pass['Credential'] = $Credential }
+    return Get-SqlCpyDbaConnection @pass
+}
+
+function Get-SqlCpyInstanceSplat {
+<#
+.SYNOPSIS
+    Returns a splat for a dbatools cmdlet that takes -SqlInstance, using a
+    pre-built Connect-DbaInstance connection object as the instance.
+
+.DESCRIPTION
+    This is the preferred helper for commands like Get-DbaSpConfigure,
+    Get-DbaLogin, Get-DbaAgentJob, Invoke-DbaQuery. The connection object
+    already carries TrustServerCertificate / EncryptConnection /
+    ConnectionTimeout, so those flags are NOT added to the returned splat
+    (the commands usually do not expose them anyway).
+
+    -SqlCredential is only emitted when the target command actually accepts
+    it - with a connection object the credential has already been consumed,
+    but some cmdlets still expose the parameter and won't object.
+
+    A timeout parameter is routed in if the target command exposes one under
+    any of the known names (ConnectionTimeout / ConnectTimeout /
+    StatementTimeout); this lets Invoke-DbaQuery receive a statement timeout
+    even when the server name is already a connection object.
+
+.PARAMETER Config
+    Config hashtable.
+
+.PARAMETER Connection
+    Pre-built dbatools connection (from Get-SqlCpyDbaConnection).
+
+.PARAMETER CommandName
+    The dbatools cmdlet the splat targets.
+
+.PARAMETER SimulatedParameters
+    Test-only override.
+
+.OUTPUTS
+    Hashtable.
+#>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)] [hashtable]$Config,
+        [Parameter(Mandatory)] $Connection,
+        [string]$CommandName,
+        [string[]]$SimulatedParameters
+    )
+
+    $paramSet = $null
+    if ($PSBoundParameters.ContainsKey('SimulatedParameters')) {
+        $paramSet = Get-SqlCpyCommandParameter -Name 'simulated' -Simulated $SimulatedParameters
+    } elseif ($CommandName) {
+        $paramSet = Get-SqlCpyCommandParameter -Name $CommandName
+    }
+
+    $splat = @{ SqlInstance = $Connection }
+
+    if ($Config.ContainsKey('ConnectionTimeoutSeconds') -and $Config.ConnectionTimeoutSeconds -and $paramSet) {
+        $resolved = Resolve-SqlCpyParameterName -ParameterSet $paramSet -Candidates @('ConnectionTimeout','ConnectTimeout','StatementTimeout')
+        if ($resolved) { $splat[$resolved] = [int]$Config.ConnectionTimeoutSeconds }
+    }
+
+    return $splat
+}
+
 function Test-SqlCpyPreflight {
 <#
 .SYNOPSIS
     Validates that both source and target SQL Server instances are reachable
     under the configured connection security settings, with actionable
     diagnostics for common failure modes.
+
+.DESCRIPTION
+    On success, caches the opened source/target connection objects on the
+    -Config hashtable under the keys `_SourceConnection` and `_TargetConnection`
+    so migration/compare functions can reuse them and inherit the same
+    TrustServerCertificate / EncryptConnection decision that preflight made.
+    This is what guarantees a successful preflight means Step 1 (Compare
+    server configuration) uses the same trust behavior.
 
 .OUTPUTS
     [bool].
@@ -354,8 +481,8 @@ function Test-SqlCpyPreflight {
     Write-SqlCpyInfo "Connection security: $sec"
 
     $targets = @(
-        @{ Role = 'Source'; Server = $Config.SourceServer; Credential = $Config.SourceCredential }
-        @{ Role = 'Target'; Server = $Config.TargetServer; Credential = $Config.TargetCredential }
+        @{ Role = 'Source'; Server = $Config.SourceServer; Credential = $Config.SourceCredential; CacheKey = '_SourceConnection' }
+        @{ Role = 'Target'; Server = $Config.TargetServer; Credential = $Config.TargetCredential; CacheKey = '_TargetConnection' }
     )
 
     $allOk = $true
@@ -368,11 +495,14 @@ function Test-SqlCpyPreflight {
 
         Write-SqlCpyInfo ("Connecting to {0}: {1}" -f $t.Role, $t.Server)
         try {
-            $splat = Get-SqlCpyConnectionSplat -Config $Config -Server $t.Server -Credential $t.Credential -CommandName 'Connect-DbaInstance'
-            $conn = Connect-DbaInstance @splat -ErrorAction Stop
+            $connPass = @{ Config = $Config; Server = $t.Server }
+            if ($t.Credential) { $connPass['Credential'] = $t.Credential }
+            $conn = Get-SqlCpyDbaConnection @connPass
+            $Config[$t.CacheKey] = $conn
             Write-SqlCpyInfo ("  OK  {0} version {1}" -f $conn.Name, $conn.VersionString)
         } catch {
             $allOk = $false
+            $Config.Remove($t.CacheKey) | Out-Null
             $msg = $_.Exception.Message
             Write-SqlCpyError ("{0} connection failed: {1}" -f $t.Role, $msg)
             Write-SqlCpyInfo  (Get-SqlCpyConnectionErrorHint -Message $msg -Config $Config)
@@ -380,11 +510,57 @@ function Test-SqlCpyPreflight {
     }
 
     if ($allOk) {
-        Write-SqlCpyInfo 'Preflight OK.'
+        Write-SqlCpyInfo 'Preflight OK. Reusing authenticated connection objects for subsequent steps.'
     } else {
         Write-SqlCpyWarning 'Preflight failed. Fix the issues above before running migration steps.'
     }
     return $allOk
+}
+
+function Get-SqlCpyCachedConnection {
+<#
+.SYNOPSIS
+    Returns a cached source/target dbatools connection (from a successful
+    preflight) or opens a fresh one when no cache entry exists.
+
+.DESCRIPTION
+    Migration and compare functions call this instead of rebuilding a
+    connection from scratch. Reusing the preflight connection is what makes
+    TrustServerCertificate apply consistently to downstream cmdlets that do
+    not expose the parameter directly - most importantly Get-DbaSpConfigure,
+    which drove the original "certificate chain was issued by an authority
+    that is not trusted" failure on the Compare step.
+
+.PARAMETER Config
+    Config hashtable.
+
+.PARAMETER Role
+    'Source' or 'Target'.
+
+.PARAMETER Server
+    Server name; used only when no cached connection is present and a fresh
+    connection must be opened.
+
+.PARAMETER Credential
+    Credential; used only on a cache miss.
+#>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [hashtable]$Config,
+        [Parameter(Mandatory)] [ValidateSet('Source','Target')] [string]$Role,
+        [Parameter(Mandatory)] [string]$Server,
+        [AllowNull()] [System.Management.Automation.PSCredential]$Credential
+    )
+
+    $cacheKey = if ($Role -eq 'Source') { '_SourceConnection' } else { '_TargetConnection' }
+    if ($Config.ContainsKey($cacheKey) -and $Config[$cacheKey]) {
+        return $Config[$cacheKey]
+    }
+    $connPass = @{ Config = $Config; Server = $Server }
+    if ($Credential) { $connPass['Credential'] = $Credential }
+    $conn = Get-SqlCpyDbaConnection @connPass
+    $Config[$cacheKey] = $conn
+    return $conn
 }
 
 function Get-SqlCpyConnectionErrorHint {
@@ -409,7 +585,7 @@ function Get-SqlCpyConnectionErrorHint {
         }
         'certificate chain|not trusted|SSL Provider|certificate.*(validation|verify)' {
             if ($trust) {
-                return "Hint: TrustServerCertificate is already `$true but the driver still refused the cert. Check that the server actually speaks TLS (port, firewall) and that the error is not masking a different failure."
+                return "Hint: TrustServerCertificate is already `$true in config. If Preflight passed and this error came from a later step, the migration function is not reusing the preflight connection object. Confirm the caller is using Get-SqlCpyCachedConnection / Get-SqlCpyInstanceSplat rather than building a raw splat with a server name. If Preflight itself failed here, verify the server really speaks TLS on the configured port."
             }
             return "Hint: The SQL Server presented a certificate your client could not validate. For local/admin migrations set TrustServerCertificate = `$true in config/local.psd1 (understand the MITM risk). For production, install a properly chained server certificate."
         }

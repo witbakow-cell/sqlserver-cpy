@@ -14,8 +14,9 @@ function Invoke-SqlCpySsisCatalogCopy {
     the user via the TUI to create the catalog first (out of scope for this
     initial scaffold).
 
-    Honours the DryRun flag. Connection security parameters flow via
-    Get-SqlCpyCopySplat.
+    Honours the DryRun flag. Connection security flows via Connect-DbaInstance
+    connection objects reused from preflight; Copy-DbaSsisCatalog accepts them
+    on -Source / -Destination.
 
 .PARAMETER SourceServer
     Source SQL Server instance name.
@@ -58,7 +59,10 @@ function Invoke-SqlCpySsisCatalogCopy {
         return
     }
 
-    $params = Get-SqlCpyCopySplat -Config $Config -Source $SourceServer -Destination $TargetServer -CommandName 'Copy-DbaSsisCatalog'
+    $srcConn = Get-SqlCpyCachedConnection -Config $Config -Role 'Source' -Server $SourceServer -Credential $Config.SourceCredential
+    $tgtConn = Get-SqlCpyCachedConnection -Config $Config -Role 'Target' -Server $TargetServer -Credential $Config.TargetCredential
+
+    $params = Get-SqlCpyCopySplat -Config $Config -SourceConnection $srcConn -DestinationConnection $tgtConn -CommandName 'Copy-DbaSsisCatalog'
     $params['EnableException'] = $true
     if ($FolderFilter) { $params['Folder'] = $FolderFilter }
 

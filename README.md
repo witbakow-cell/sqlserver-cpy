@@ -54,28 +54,43 @@ These flow into every `dbatools` cmdlet the tool calls through `Get-SqlCpyConnec
 ### dbatools parameter compatibility
 
 `dbatools` cmdlets do **not** all expose the same connection parameters. Most notably,
-`-ConnectionTimeout` exists on `Connect-DbaInstance` and `Invoke-DbaQuery` but **not** on
-`Get-DbaSpConfigure`, `Copy-DbaSpConfigure`, `Copy-DbaLogin`, `Copy-DbaAgentJob`, or
-`Copy-DbaSsisCatalog` in the 2.x line. An earlier version of the scaffold added
-`-ConnectionTimeout` to every splat, which produced this error on the very first
-menu action:
+`-TrustServerCertificate` / `-EncryptConnection` and `-ConnectionTimeout` exist on
+`Connect-DbaInstance` and `Invoke-DbaQuery` but **not** on `Get-DbaSpConfigure`,
+`Copy-DbaSpConfigure`, `Get-DbaLogin`, `Copy-DbaLogin`, `Get-DbaAgentJob`,
+`Copy-DbaAgentJob`, or `Copy-DbaSsisCatalog` in the 2.x line. Two symptoms came out
+of this asymmetry:
 
-```
-ERROR  Source connection failed: A parameter cannot be found that matches parameter
-name 'ConnectionTimeout'.
-```
+1. Unconditionally splatting `-ConnectionTimeout` onto every cmdlet failed with
+   `A parameter cannot be found that matches parameter name 'ConnectionTimeout'.`
+2. Dynamically filtering the splat fixed (1) but silently **dropped
+   `-TrustServerCertificate`**, so `Get-DbaSpConfigure` fell back to strict chain
+   validation and failed with _"The certificate chain was issued by an authority
+   that is not trusted"_ on servers with self-signed / internal CA certs (e.g.
+   `chbbbid2`).
 
-The splat helpers now take an optional `-CommandName` and filter the emitted hashtable
-against the real parameter set of that cmdlet (via `Get-Command`). If the command does
-not expose any timeout parameter, the timeout is silently skipped for that call; your
-configured `ConnectionTimeoutSeconds` is still honoured by `Connect-DbaInstance` and
-`Invoke-DbaQuery`, including during Preflight. There is nothing you need to change in
-config — keep `ConnectionTimeoutSeconds` set to whatever suits your environment.
+The robust fix is to apply `TrustServerCertificate = $true` through a
+`Connect-DbaInstance` **connection object** and pass that object as `-SqlInstance`
+(or `-Source` / `-Destination`) to downstream cmdlets. Those cmdlets reuse the
+already-open connection, inheriting its trust and encryption decision without
+needing their own trust parameters. This is what `sqlserver-cpy` now does:
 
-If you add a new migration function, pass `-CommandName` to `Get-SqlCpyConnectionSplat`
-/ `Get-SqlCpyCopySplat` so the same filtering applies. See
-[`DEPENDENCIES.md`](DEPENDENCIES.md#dbatools-parameter-compatibility) for details and
-the list of parameter-name candidates the helpers try (`ConnectionTimeout`,
+- `Test-SqlCpyPreflight` opens connection objects via `Get-SqlCpyDbaConnection`
+  and caches them on the `$Config` hashtable as `_SourceConnection` and
+  `_TargetConnection`.
+- Migration and compare functions (`Invoke-SqlCpyServerConfigCompare`,
+  `Invoke-SqlCpyLoginCopy`, `Invoke-SqlCpyAgentJobCopy`,
+  `Invoke-SqlCpySsisCatalogCopy`, `Invoke-SqlCpySchemaOnlyDatabaseCopy`) call
+  `Get-SqlCpyCachedConnection` to retrieve those handles and pass them through
+  `Get-SqlCpyInstanceSplat` / `Get-SqlCpyCopySplat`.
+- A successful preflight therefore guarantees Step 1 (_Compare server
+  configuration_) and every later step uses the **same** TLS/trust behaviour
+  preflight validated.
+
+`Get-SqlCpyConnectionSplat` / `Get-SqlCpyCopySplat` still exist for raw-name
+calls and still filter against `Get-Command`. The preferred path for new code is
+the connection-object one. See
+[`DEPENDENCIES.md`](DEPENDENCIES.md#dbatools-parameter-compatibility) for the
+full list of parameter-name candidates the helpers try (`ConnectionTimeout`,
 `ConnectTimeout`, `StatementTimeout`).
 
 ### Security tradeoff

@@ -16,17 +16,36 @@ read the help block.
 
 ## Connection / preflight
 
+- **`Get-SqlCpyDbaConnection`** (`src/SqlServerCpy/Public/Connection.ps1`)
+  — Opens a `Connect-DbaInstance` handle with `TrustServerCertificate = $true`
+  applied at the connection level. This is the preferred entry point because
+  downstream dbatools cmdlets (Get-DbaSpConfigure, Get-DbaLogin, Copy-Dba*)
+  inherit the trust decision automatically when the handle is reused as
+  `-SqlInstance` / `-Source` / `-Destination`, even though those cmdlets
+  themselves do not expose `-TrustServerCertificate`.
+- **`Get-SqlCpyDbaInstance`** (`src/SqlServerCpy/Public/Connection.ps1`)
+  — Back-compat wrapper around `Get-SqlCpyDbaConnection`.
+- **`Get-SqlCpyCachedConnection`** (`src/SqlServerCpy/Public/Connection.ps1`)
+  — Returns the source/target connection object cached on `$Config` by a
+  successful `Test-SqlCpyPreflight`, or opens a fresh one on cache miss. Used
+  by every migration / compare function so Step 1 and later steps reuse
+  exactly the same authenticated handle.
+- **`Get-SqlCpyInstanceSplat`** (`src/SqlServerCpy/Public/Connection.ps1`)
+  — Builds a splat of the form `@{ SqlInstance = <connection object>; ... }`
+  for dbatools cmdlets that accept `-SqlInstance`. Trust/encrypt flags are
+  intentionally omitted (they are already on the connection object).
 - **`Get-SqlCpyConnectionSplat`** (`src/SqlServerCpy/Public/Connection.ps1`)
-  — Builds a hashtable of connection-security parameters (`SqlInstance`,
-  `EncryptConnection`, `TrustServerCertificate`, `SqlCredential`, and a timeout if
-  supported) filtered to match the parameter set of the target cmdlet. Pass
-  `-CommandName` with the dbatools cmdlet you are about to invoke (e.g.
-  `Get-DbaSpConfigure`, `Get-DbaLogin`, `Invoke-DbaQuery`). Without
-  `-CommandName`, the splat omits any command-version-sensitive parameter to stay
-  safe.
+  — Legacy raw-name splat builder: takes a server string and emits
+  `SqlInstance`/`EncryptConnection`/`TrustServerCertificate`/`SqlCredential`
+  and a timeout, filtered to the parameter set of the target cmdlet via
+  `-CommandName`. Used by `Get-SqlCpyDbaConnection` itself to call
+  `Connect-DbaInstance`. Prefer `Get-SqlCpyInstanceSplat` for everything else.
 - **`Get-SqlCpyCopySplat`** (`src/SqlServerCpy/Public/Connection.ps1`)
-  — Same idea for `Copy-Dba*` cmdlets that take `-Source` / `-Destination`. Also
-  respects `-CommandName` filtering.
+  — Splat builder for `Copy-Dba*` cmdlets that take `-Source` / `-Destination`.
+  Accepts pre-built connection objects via `-SourceConnection` /
+  `-DestinationConnection`; when supplied, those replace the raw name strings
+  and command-level trust/encrypt flags are omitted. Also filters against
+  `-CommandName`.
 - **`Get-SqlCpyCommandParameter`** (`src/SqlServerCpy/Public/Connection.ps1`)
   — Returns the parameter names (and alias map) a given command exposes, via
   `Get-Command`. Supports a `-Simulated` list for tests that must not depend on
@@ -36,14 +55,12 @@ read the help block.
   names, returns the first name the command actually accepts (parameter or
   alias). Used to route a configured timeout into whatever name the installed
   dbatools version uses.
-- **`Get-SqlCpyDbaInstance`** (`src/SqlServerCpy/Public/Connection.ps1`)
-  — Opens a `Connect-DbaInstance` SMO handle honouring the connection-security config.
-  Use this when a downstream cmdlet does not expose `-EncryptConnection` /
-  `-TrustServerCertificate`.
 - **`Test-SqlCpyPreflight`** (`src/SqlServerCpy/Public/Connection.ps1`)
   — Validates source and target connectivity under the configured TLS settings and
   prints actionable diagnostics for untrusted certificate chains, auth failures,
-  network failures, and missing `dbatools`. Returns `$true`/`$false`.
+  network failures, and missing `dbatools`. On success, caches the opened
+  connection objects on `$Config._SourceConnection` / `$Config._TargetConnection`
+  so later steps reuse them. Returns `$true`/`$false`.
 - **`Get-SqlCpyConnectionErrorHint`** (`src/SqlServerCpy/Public/Connection.ps1`)
   — Maps a SQL connection error message to a one-line remediation hint.
 

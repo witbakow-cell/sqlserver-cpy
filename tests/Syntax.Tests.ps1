@@ -90,7 +90,10 @@ if ($manifest) {
     $mustExport = @(
         'Get-SqlCpyConnectionSplat'
         'Get-SqlCpyCopySplat'
+        'Get-SqlCpyInstanceSplat'
+        'Get-SqlCpyDbaConnection'
         'Get-SqlCpyDbaInstance'
+        'Get-SqlCpyCachedConnection'
         'Test-SqlCpyPreflight'
         'Get-SqlCpyConnectionErrorHint'
         'Get-SqlCpyCommandParameter'
@@ -226,6 +229,112 @@ try {
         }
     } else {
         Write-Host "  OK  param-binding hint: $paramHint"
+    }
+
+    # ---- Case 7: Get-SqlCpyInstanceSplat passes the connection object as
+    # -SqlInstance and DOES NOT attach TrustServerCertificate / EncryptConnection
+    # (those are baked into the connection, and Get-DbaSpConfigure / Get-DbaLogin
+    # do not expose them anyway). This is the core of the
+    # "certificate chain not trusted" fix.
+    $fakeConn = [pscustomobject]@{ Name = 'chbbbid2'; VersionString = '15.0.0.0' }
+    $instSplat = Get-SqlCpyInstanceSplat -Config $probeCfg -Connection $fakeConn -SimulatedParameters @('SqlInstance')
+    if (-not $instSplat.ContainsKey('SqlInstance')) {
+        $failures += [pscustomobject]@{
+            File   = $connFile
+            Errors = 'Get-SqlCpyInstanceSplat did not set -SqlInstance to the connection object.'
+        }
+    } elseif (-not [object]::ReferenceEquals($instSplat.SqlInstance, $fakeConn)) {
+        $failures += [pscustomobject]@{
+            File   = $connFile
+            Errors = 'Get-SqlCpyInstanceSplat set -SqlInstance but not to the supplied connection object.'
+        }
+    } else {
+        Write-Host "  OK  instance splat carries the connection object as -SqlInstance"
+    }
+    foreach ($forbidden in 'TrustServerCertificate','EncryptConnection') {
+        if ($instSplat.ContainsKey($forbidden)) {
+            $failures += [pscustomobject]@{
+                File   = $connFile
+                Errors = "Get-SqlCpyInstanceSplat must not emit -$forbidden when using a connection object (it is baked in)."
+            }
+        } else {
+            Write-Host "  OK  instance splat correctly omits -$forbidden"
+        }
+    }
+
+    # ---- Case 8: instance splat routes a timeout when the target command exposes one.
+    $instTimed = Get-SqlCpyInstanceSplat -Config $probeCfg -Connection $fakeConn -SimulatedParameters @('SqlInstance','ConnectionTimeout')
+    if ($instTimed.ConnectionTimeout -ne 15) {
+        $failures += [pscustomobject]@{
+            File   = $connFile
+            Errors = "Get-SqlCpyInstanceSplat should route ConnectionTimeout when the command supports it; got $($instTimed.ConnectionTimeout)"
+        }
+    } else {
+        Write-Host "  OK  instance splat routed ConnectionTimeout when supported"
+    }
+
+    # ---- Case 9: Get-SqlCpyCopySplat with connection objects substitutes them
+    # into -Source / -Destination and drops command-level trust flags.
+    $srcC = [pscustomobject]@{ Role = 'src' }
+    $dstC = [pscustomobject]@{ Role = 'dst' }
+    $copyConnSplat = Get-SqlCpyCopySplat -Config $probeCfg -SourceConnection $srcC -DestinationConnection $dstC -SimulatedParameters @('Source','Destination','EncryptConnection','TrustServerCertificate','SourceSqlCredential','DestinationSqlCredential')
+    if (-not [object]::ReferenceEquals($copyConnSplat.Source, $srcC) -or -not [object]::ReferenceEquals($copyConnSplat.Destination, $dstC)) {
+        $failures += [pscustomobject]@{
+            File   = $connFile
+            Errors = "Get-SqlCpyCopySplat did not route connection objects into Source/Destination."
+        }
+    } else {
+        Write-Host "  OK  copy splat put connection objects into -Source/-Destination"
+    }
+    foreach ($forbidden in 'TrustServerCertificate','EncryptConnection') {
+        if ($copyConnSplat.ContainsKey($forbidden)) {
+            $failures += [pscustomobject]@{
+                File   = $connFile
+                Errors = "Get-SqlCpyCopySplat with connection objects must not emit -$forbidden."
+            }
+        } else {
+            Write-Host "  OK  copy-with-connections splat correctly omits -$forbidden"
+        }
+    }
+
+    # ---- Case 10: raw-name call still emits trust/encrypt flags for backward
+    # compatibility with callers that have not yet switched to connection objects.
+    $copyRawSplat = Get-SqlCpyCopySplat -Config $probeCfg -Source 'a' -Destination 'b' -SimulatedParameters @('Source','Destination','EncryptConnection','TrustServerCertificate')
+    foreach ($expected in 'TrustServerCertificate','EncryptConnection') {
+        if (-not $copyRawSplat.ContainsKey($expected)) {
+            $failures += [pscustomobject]@{
+                File   = $connFile
+                Errors = "Get-SqlCpyCopySplat raw-name path dropped $expected; cfg has it set."
+            }
+        }
+    }
+    Write-Host "  OK  copy splat raw-name path still carries trust/encrypt"
+
+    # ---- Case 11: ServerConfig.ps1 uses the cached connection helper, i.e.
+    # the Compare step asks for a connection object rather than building a
+    # raw -SqlInstance string splat. If this regresses we would lose trust
+    # on Get-DbaSpConfigure again.
+    $srvCfgPath = Join-Path -Path $repoRoot -ChildPath 'src/SqlServerCpy/Public/ServerConfig.ps1'
+    $srvCfgText = Get-Content -LiteralPath $srvCfgPath -Raw
+    if ($srvCfgText -notmatch 'Get-SqlCpyCachedConnection' -or $srvCfgText -notmatch 'Get-SqlCpyInstanceSplat') {
+        $failures += [pscustomobject]@{
+            File   = $srvCfgPath
+            Errors = 'ServerConfig.ps1 must obtain Get-DbaSpConfigure input via Get-SqlCpyCachedConnection + Get-SqlCpyInstanceSplat (connection-object path) so TrustServerCertificate applies.'
+        }
+    } else {
+        Write-Host "  OK  ServerConfig uses connection-object helpers"
+    }
+
+    # ---- Case 12: Test-SqlCpyPreflight caches connection objects on Config so
+    # Compare/Apply reuse exactly the same trust decision.
+    $preflightText = (Get-Content -LiteralPath $connFile -Raw)
+    if ($preflightText -notmatch '_SourceConnection' -or $preflightText -notmatch '_TargetConnection') {
+        $failures += [pscustomobject]@{
+            File   = $connFile
+            Errors = 'Test-SqlCpyPreflight must cache connection objects as $Config._SourceConnection / $Config._TargetConnection for downstream reuse.'
+        }
+    } else {
+        Write-Host "  OK  Preflight caches connection objects on Config"
     }
 } catch {
     $failures += [pscustomobject]@{
