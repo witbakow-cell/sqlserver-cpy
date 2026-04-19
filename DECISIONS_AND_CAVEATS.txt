@@ -295,6 +295,42 @@ Observations
        * DryRun is the default and the artifacts are written anyway,
          so the user can review exactly what would be applied before
          flipping DryRun off.
+       * Tables phase is per-table by default. On some sources the SMO
+         metadata query against sys.indexes for a specific table does
+         not return (observed on dwcontrol: [integra].[Execution]
+         object_id 295672101 and [integra].[Application]
+         object_id 208719796; sys.dm_exec_requests shows the SPID
+         running without a blocking_session_id). To keep a single
+         pathological table from hanging the whole copy:
+           - SchemaOnlyTableScriptMode = 'PerTable' (default) iterates
+             tables one at a time and logs:
+                 [table] scripting [schema].[table] object_id=... (timeout=Ns)
+                 [table] done      [schema].[table] in S.ss (N lines)
+             before and after each table, so the TUI shows which table
+             is in flight at any moment.
+           - SchemaOnlyTableScriptTimeoutSeconds (default 300) applies
+             a wall-clock timeout PER table by invoking .Script($opts)
+             in an isolated PowerShell runspace. When the deadline
+             expires the runspace is stopped, the table is added to
+             <output>/<db>/_skipped_tables.txt with a TIMEOUT record,
+             and the phase continues. The timeout is best-effort: if
+             SMO is blocked inside a native SqlClient socket read the
+             underlying TCP call may linger in the background, but the
+             main runspace is freed and the run completes.
+           - SchemaOnlyExcludeTables (default @()) is an explicit skip
+             list. Entries accept any of: '[schema].[table]',
+             'schema.table', bare 'table' (matches any schema), or a
+             numeric sys.objects.object_id. Matching is case-insensitive
+             and strips brackets, so user-facing syntax is tolerant.
+             The default list is empty on purpose; the two known-hanging
+             tables are documented as a local-config example rather than
+             being hard-coded so different environments can opt in.
+           - SchemaOnlyTableScriptMode = 'Collection' restores the
+             legacy whole-collection path for users who do not want the
+             per-table wrapping (no timeout, no per-table log lines).
+           - Every run writes <output>/<db>/_skipped_tables.txt - even
+             when nothing was skipped - so operators always have a
+             one-glance record of what the Tables phase did.
 
 Caveats
 -------

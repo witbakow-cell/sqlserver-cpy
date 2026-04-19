@@ -665,7 +665,7 @@ try {
 }
 
 if ($manifest) {
-    foreach ($fn in 'Export-SqlCpySchemaOnlyDatabase','New-SqlCpySchemaOnlyScriptingOption','Get-SqlCpySchemaOnlyObjectTypeDefaults','Get-SqlCpySchemaOnlySecurityExcludedTypes','Get-SqlCpySchemaOnlyScriptPhases','Get-SqlCpySchemaOnlyInlineOnlyTypes') {
+    foreach ($fn in 'Export-SqlCpySchemaOnlyDatabase','New-SqlCpySchemaOnlyScriptingOption','Get-SqlCpySchemaOnlyObjectTypeDefaults','Get-SqlCpySchemaOnlySecurityExcludedTypes','Get-SqlCpySchemaOnlyScriptPhases','Get-SqlCpySchemaOnlyInlineOnlyTypes','Test-SqlCpySchemaOnlyTableExcluded','Invoke-SqlCpyScriptObjectWithTimeout') {
         if ($manifest.FunctionsToExport -notcontains $fn) {
             $failures += [pscustomobject]@{
                 File = $manifestPath
@@ -674,6 +674,183 @@ if ($manifest) {
         } else {
             Write-Host "  OK  manifest exports $fn"
         }
+    }
+}
+
+Write-Host ''
+Write-Host 'Checking per-table scripting config keys...' -ForegroundColor Cyan
+try {
+    $cfg3 = Import-PowerShellDataFile -Path $cfgPath
+    foreach ($k in 'SchemaOnlyTableScriptMode','SchemaOnlyExcludeTables','SchemaOnlyTableScriptTimeoutSeconds') {
+        if (-not $cfg3.ContainsKey($k)) {
+            $failures += [pscustomobject]@{
+                File = $cfgPath
+                Errors = "Missing per-table config key: $k"
+            }
+        } else {
+            Write-Host "  OK  config has $k = $($cfg3[$k])"
+        }
+    }
+    if ($cfg3.SchemaOnlyTableScriptMode -ne 'PerTable') {
+        $failures += [pscustomobject]@{
+            File = $cfgPath
+            Errors = "SchemaOnlyTableScriptMode must default to 'PerTable'; got '$($cfg3.SchemaOnlyTableScriptMode)'"
+        }
+    }
+    if ($cfg3.SchemaOnlyTableScriptTimeoutSeconds -ne 300) {
+        $failures += [pscustomobject]@{
+            File = $cfgPath
+            Errors = "SchemaOnlyTableScriptTimeoutSeconds must default to 300; got $($cfg3.SchemaOnlyTableScriptTimeoutSeconds)"
+        }
+    }
+    # The default must not hard-code the known-problem tables; they live as
+    # documentation only.
+    if (@($cfg3.SchemaOnlyExcludeTables).Count -ne 0) {
+        $failures += [pscustomobject]@{
+            File = $cfgPath
+            Errors = "SchemaOnlyExcludeTables must default to an empty array (user decides per install). Got: $($cfg3.SchemaOnlyExcludeTables -join ', ')"
+        }
+    }
+} catch {
+    $failures += [pscustomobject]@{
+        File = $cfgPath
+        Errors = $_.Exception.Message
+    }
+}
+
+Write-Host ''
+Write-Host 'Probing Test-SqlCpySchemaOnlyTableExcluded...' -ForegroundColor Cyan
+try {
+    # Helper already dot-sourced via $schemaFile above.
+    $list = @('[integra].[Execution]', 'integra.Application', 'OtherTable', '295672101')
+
+    $tblCases = @(
+        @{ Schema='integra'; Table='Execution';   Oid=295672101; Expected=$true  }  # bracketed full match + oid
+        @{ Schema='integra'; Table='Application'; Oid=208719796; Expected=$true  }  # plain schema.table + oid match on diff entry
+        @{ Schema='dbo';     Table='OtherTable';  Oid=1;         Expected=$true  }  # bare-name match, any schema
+        @{ Schema='integra'; Table='OtherTable';  Oid=2;         Expected=$true  }  # bare-name match, any schema
+        @{ Schema='INTEGRA'; Table='EXECUTION';   Oid=0;         Expected=$true  }  # case-insensitive
+        @{ Schema='dbo';     Table='Execution';   Oid=0;         Expected=$false }  # schema mismatch
+        @{ Schema='integra'; Table='Other';       Oid=0;         Expected=$false }  # no match
+        @{ Schema='dbo';     Table='Misc';        Oid=295672101; Expected=$true  }  # matches by object_id alone
+        @{ Schema='dbo';     Table='Misc';        Oid=999999;    Expected=$false } # different object_id
+    )
+    foreach ($c in $tblCases) {
+        $got = Test-SqlCpySchemaOnlyTableExcluded -SchemaName $c.Schema -TableName $c.Table -ObjectId $c.Oid -ExcludeList $list
+        if ($got -ne $c.Expected) {
+            $failures += [pscustomobject]@{
+                File = $schemaFile
+                Errors = ("Test-SqlCpySchemaOnlyTableExcluded schema={0} table={1} oid={2} returned {3}, expected {4}" -f $c.Schema,$c.Table,$c.Oid,$got,$c.Expected)
+            }
+        } else {
+            Write-Host ("  OK  exclude[{0}.{1} oid={2}] = {3}" -f $c.Schema,$c.Table,$c.Oid,$got)
+        }
+    }
+
+    # Empty list never excludes.
+    if (Test-SqlCpySchemaOnlyTableExcluded -SchemaName 'x' -TableName 'y' -ObjectId 1 -ExcludeList @()) {
+        $failures += [pscustomobject]@{
+            File = $schemaFile
+            Errors = 'Empty ExcludeList must never exclude.'
+        }
+    } else {
+        Write-Host '  OK  empty exclude list -> never excluded'
+    }
+
+    # Null list never excludes.
+    if (Test-SqlCpySchemaOnlyTableExcluded -SchemaName 'x' -TableName 'y' -ObjectId 1 -ExcludeList $null) {
+        $failures += [pscustomobject]@{
+            File = $schemaFile
+            Errors = 'Null ExcludeList must never exclude.'
+        }
+    } else {
+        Write-Host '  OK  null exclude list -> never excluded'
+    }
+
+    # Whitespace-only entries must be ignored, not match everything.
+    if (Test-SqlCpySchemaOnlyTableExcluded -SchemaName 'x' -TableName 'y' -ObjectId 1 -ExcludeList @('', '   ')) {
+        $failures += [pscustomobject]@{
+            File = $schemaFile
+            Errors = 'Whitespace-only entries in ExcludeList must be ignored.'
+        }
+    } else {
+        Write-Host '  OK  whitespace-only entries ignored'
+    }
+
+    # Numeric entry that does not match object_id must not coincidentally match a name.
+    if (Test-SqlCpySchemaOnlyTableExcluded -SchemaName 'dbo' -TableName '295672101' -ObjectId 0 -ExcludeList @('295672101')) {
+        $failures += [pscustomobject]@{
+            File = $schemaFile
+            Errors = "Numeric entry must match object_id, not a name that happens to be all-digits (without oid)."
+        }
+    } else {
+        Write-Host '  OK  numeric entry does not match all-digit table name without object_id'
+    }
+} catch {
+    $failures += [pscustomobject]@{
+        File = $schemaFile
+        Errors = "Table-exclusion probe failed: $($_.Exception.Message)"
+    }
+}
+
+Write-Host ''
+Write-Host 'Probing Invoke-SqlCpyScriptObjectWithTimeout...' -ForegroundColor Cyan
+try {
+    # Fast path: a mock item whose Script($opts) returns quickly.
+    $fast = [pscustomobject]@{ Name = 'fast' }
+    $fast | Add-Member -MemberType ScriptMethod -Name Script -Force -Value {
+        param($opts)
+        return @('SELECT 1;','SELECT 2;')
+    }
+    $fastOut = Invoke-SqlCpyScriptObjectWithTimeout -Item $fast -Options ([pscustomobject]@{}) -TimeoutSeconds 5
+    if (($fastOut -join '|') -notmatch 'SELECT 1') {
+        $failures += [pscustomobject]@{
+            File = $schemaFile
+            Errors = "Invoke-SqlCpyScriptObjectWithTimeout fast path did not return expected lines; got: $($fastOut -join '|')"
+        }
+    } else {
+        Write-Host "  OK  timeout helper returns lines on the fast path"
+    }
+
+    # Timeout path: Start-Sleep longer than the timeout must raise.
+    $slow = [pscustomobject]@{ Name = 'slow' }
+    $slow | Add-Member -MemberType ScriptMethod -Name Script -Force -Value {
+        param($opts)
+        Start-Sleep -Seconds 5
+        return @('SHOULD NOT APPEAR')
+    }
+    $timedOut = $false
+    try {
+        Invoke-SqlCpyScriptObjectWithTimeout -Item $slow -Options ([pscustomobject]@{}) -TimeoutSeconds 1 | Out-Null
+    } catch {
+        if ($_.Exception.Message -match 'timed out after') { $timedOut = $true }
+    }
+    if (-not $timedOut) {
+        $failures += [pscustomobject]@{
+            File = $schemaFile
+            Errors = "Invoke-SqlCpyScriptObjectWithTimeout did not raise 'timed out after' on slow mock."
+        }
+    } else {
+        Write-Host "  OK  timeout helper aborts on slow mock"
+    }
+
+    # Invalid timeout must throw.
+    $badThrew = $false
+    try {
+        Invoke-SqlCpyScriptObjectWithTimeout -Item $fast -Options $null -TimeoutSeconds 0 | Out-Null
+    } catch { $badThrew = $true }
+    if (-not $badThrew) {
+        $failures += [pscustomobject]@{
+            File = $schemaFile
+            Errors = "Invoke-SqlCpyScriptObjectWithTimeout must reject TimeoutSeconds <= 0."
+        }
+    } else {
+        Write-Host "  OK  timeout helper rejects non-positive TimeoutSeconds"
+    }
+} catch {
+    $failures += [pscustomobject]@{
+        File = $schemaFile
+        Errors = "Timeout helper probe failed: $($_.Exception.Message)"
     }
 }
 

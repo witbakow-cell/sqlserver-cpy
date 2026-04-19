@@ -68,6 +68,41 @@
     # re-enable scripting of users/roles/permissions.
     SchemaOnlyExcludeSecurity = $true
 
+    # Schema-only copy: how the Tables phase emits scripts.
+    #   'PerTable'   - iterate tables one at a time, log before/after with
+    #                  [schema].[table] object_id=... and elapsed seconds, and
+    #                  apply SchemaOnlyTableScriptTimeoutSeconds per table.
+    #                  Required when any single table hangs SMO (observed on
+    #                  [integra].[Execution] / [integra].[Application] on some
+    #                  SQL 2022 sources - the sys.indexes metadata query issued
+    #                  by SMO does not return). This is the default.
+    #   'Collection' - legacy behaviour: iterate $db.Tables in one go. Faster
+    #                  in aggregate but a single pathological table can block
+    #                  the whole phase with no progress output.
+    SchemaOnlyTableScriptMode = 'PerTable'
+
+    # Schema-only copy: tables to skip during the Tables phase. Entries are
+    # matched case-insensitively and accept any of these forms:
+    #   '[schema].[table]'   -- bracketed, e.g. '[integra].[Execution]'
+    #   'schema.table'       -- plain, e.g. 'integra.Execution'
+    #   'table'              -- bare name (schema defaults to dbo unless
+    #                           qualified; matches any schema as a fallback)
+    #   '<object_id>'        -- numeric sys.objects.object_id, e.g. 295672101
+    # Example for the two known-hanging tables on dwcontrol:
+    #   SchemaOnlyExcludeTables = @('[integra].[Execution]', '[integra].[Application]')
+    # Skipped tables are logged and recorded in _skipped_tables.txt under the
+    # per-database artifacts folder so they cannot be silently omitted.
+    SchemaOnlyExcludeTables = @()
+
+    # Schema-only copy: timeout applied per table when
+    # SchemaOnlyTableScriptMode = 'PerTable'. The table script call runs in an
+    # isolated PowerShell runspace; if .Script($opts) does not return inside
+    # this many seconds the runspace is stopped, the table is recorded in the
+    # skip report, and the phase continues. Best-effort - SMO/.NET may still
+    # be blocked on native socket I/O inside the stopped runspace, but the
+    # main thread is freed and the run completes.
+    SchemaOnlyTableScriptTimeoutSeconds = 300
+
     # SSIS catalog scope. $null = all folders.
     SsisFolders = $null
 

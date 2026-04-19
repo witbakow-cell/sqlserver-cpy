@@ -60,6 +60,8 @@
         'Get-SqlCpySchemaOnlySystemSchemaNames'
         'Format-SqlCpySchemaCreateStatement'
         'Get-SqlCpySchemaScriptLines'
+        'Test-SqlCpySchemaOnlyTableExcluded'
+        'Invoke-SqlCpyScriptObjectWithTimeout'
     )
     CmdletsToExport   = @()
     VariablesToExport = @()

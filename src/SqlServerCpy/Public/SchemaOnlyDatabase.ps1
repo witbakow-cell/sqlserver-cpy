@@ -441,6 +441,195 @@ function Get-SqlCpySchemaOnlyInlineOnlyTypes {
     return @('ForeignKeys','Indexes','Triggers','FullTextIndexes')
 }
 
+function Test-SqlCpySchemaOnlyTableExcluded {
+<#
+.SYNOPSIS
+    Returns $true when a table should be skipped by the schema-only Tables
+    phase, given the configured SchemaOnlyExcludeTables list.
+
+.DESCRIPTION
+    Accepted entry forms (case-insensitive):
+      '[schema].[table]'  -- bracketed, e.g. '[integra].[Execution]'
+      'schema.table'      -- plain,     e.g. 'integra.Execution'
+      'table'             -- bare name; matches any schema
+      '<object_id>'       -- sys.objects.object_id as integer or string
+
+    Matching rules:
+      * Schema and table names are compared with OrdinalIgnoreCase.
+      * Bracket characters ([ and ]) are stripped from list entries and from
+        the candidate names before comparison. This keeps users from having
+        to reason about escaping in the psd1.
+      * Leading / trailing whitespace on list entries is trimmed.
+      * A bare table name (no schema) matches any schema. This is a
+        deliberate convenience for the common case where the hanging table
+        is unique across schemas.
+      * A numeric entry matches ObjectId. Zero / negative numbers never
+        match. Parsing is invariant-culture so commas/dots in locale do not
+        interfere.
+
+.PARAMETER SchemaName
+    Schema name of the candidate table (e.g. 'integra').
+
+.PARAMETER TableName
+    Table name of the candidate table (e.g. 'Execution').
+
+.PARAMETER ObjectId
+    Optional SMO ObjectId / sys.objects.object_id of the candidate table.
+    Pass 0 when not available.
+
+.PARAMETER ExcludeList
+    Array of entries from config (SchemaOnlyExcludeTables). $null / empty =>
+    nothing is excluded.
+
+.OUTPUTS
+    [bool]
+#>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [string]$SchemaName,
+        [string]$TableName,
+        [long]$ObjectId = 0,
+        [string[]]$ExcludeList
+    )
+
+    if (-not $ExcludeList -or $ExcludeList.Count -eq 0) { return $false }
+
+    $schema = if ($null -ne $SchemaName) { $SchemaName.Trim() } else { '' }
+    $table  = if ($null -ne $TableName)  { $TableName.Trim()  } else { '' }
+
+    foreach ($raw in $ExcludeList) {
+        if ($null -eq $raw) { continue }
+        $entry = ([string]$raw).Trim()
+        if ([string]::IsNullOrWhiteSpace($entry)) { continue }
+
+        # object_id numeric match.
+        $oid = 0L
+        if ([long]::TryParse($entry, [System.Globalization.NumberStyles]::Integer,
+                             [System.Globalization.CultureInfo]::InvariantCulture,
+                             [ref]$oid)) {
+            if ($oid -gt 0 -and $ObjectId -gt 0 -and $oid -eq $ObjectId) {
+                return $true
+            }
+            # Pure number that did not match object_id is never a name match.
+            continue
+        }
+
+        # Strip brackets once for comparison. Users may write '[integra].[Execution]',
+        # 'integra.Execution', or a mix.
+        $clean = $entry.Replace('[', '').Replace(']', '').Trim()
+        if ([string]::IsNullOrWhiteSpace($clean)) { continue }
+
+        $parts = $clean.Split('.', 2)
+        if ($parts.Count -eq 2) {
+            $sPart = $parts[0].Trim()
+            $tPart = $parts[1].Trim()
+            if ([string]::IsNullOrWhiteSpace($tPart)) { continue }
+            if ([string]::Equals($sPart, $schema, [System.StringComparison]::OrdinalIgnoreCase) -and
+                [string]::Equals($tPart, $table,  [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $true
+            }
+        } else {
+            # Bare name: match any schema.
+            if ([string]::Equals($clean, $table, [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $true
+            }
+        }
+    }
+
+    return $false
+}
+
+function Invoke-SqlCpyScriptObjectWithTimeout {
+<#
+.SYNOPSIS
+    Runs $item.Script($options) in an isolated runspace with a wall-clock
+    timeout. Returns the script lines on success; throws on timeout or error.
+
+.DESCRIPTION
+    PowerShell/SMO synchronous calls cannot safely be interrupted inside the
+    caller's runspace. To let a hung table scripting call (observed on
+    [integra].[Execution] / [integra].[Application] where SMO's metadata
+    query against sys.indexes does not return) be abandoned without hanging
+    the whole TUI, we execute the call in a child runspace and stop that
+    runspace when TimeoutSeconds elapses.
+
+    Best-effort caveats:
+      * Stopping a runspace is cooperative for managed code and best-effort
+        for native I/O. If SMO is blocked inside the SqlClient socket read
+        the underlying TCP call may linger in the background until the OS
+        tears the process down, but the main runspace is freed and the
+        schema-only run continues.
+      * The SMO ScriptingOptions object carries no thread affinity in the
+        shapes we use (schema-only, no data), so passing it into the child
+        runspace is safe.
+      * The SMO item (e.g. Table) is also shared across runspaces. SMO does
+        not document thread safety, but .Script() is a read path against
+        already-fetched metadata; in practice it works, and the alternative
+        (spinning up a new Connect-DbaInstance per table) is far more
+        expensive and itself vulnerable to the same underlying hang.
+
+.PARAMETER Item
+    Required. SMO object exposing .Script($options).
+
+.PARAMETER Options
+    Optional ScriptingOptions to pass to .Script(). $null => .Script() no-arg.
+
+.PARAMETER TimeoutSeconds
+    Required. Wall-clock timeout before the child runspace is aborted.
+
+.OUTPUTS
+    [string[]] script lines.
+#>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param(
+        [Parameter(Mandatory)] $Item,
+        $Options,
+        [Parameter(Mandatory)] [int]$TimeoutSeconds
+    )
+
+    if ($TimeoutSeconds -le 0) { throw "TimeoutSeconds must be > 0 (got $TimeoutSeconds)." }
+
+    $ps = [System.Management.Automation.PowerShell]::Create()
+    try {
+        [void]$ps.AddScript({
+            param($item, $opts)
+            if ($opts) { return ,@($item.Script($opts)) }
+            return ,@($item.Script())
+        })
+        [void]$ps.AddArgument($Item)
+        [void]$ps.AddArgument($Options)
+
+        $async = $ps.BeginInvoke()
+        $waited = $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($TimeoutSeconds))
+        if (-not $waited) {
+            try { $ps.Stop() } catch { }
+            throw ("Script call timed out after {0}s" -f $TimeoutSeconds)
+        }
+
+        $result = $ps.EndInvoke($async)
+
+        if ($ps.HadErrors) {
+            $errText = ($ps.Streams.Error | ForEach-Object { $_.ToString() }) -join ' | '
+            throw ("Script call raised errors: {0}" -f $errText)
+        }
+
+        $out = @()
+        foreach ($r in $result) {
+            if ($null -eq $r) { continue }
+            if ($r -is [System.Collections.IEnumerable] -and -not ($r -is [string])) {
+                foreach ($line in $r) { $out += ,[string]$line }
+            } else {
+                $out += ,[string]$r
+            }
+        }
+        return ,$out
+    } finally {
+        try { $ps.Dispose() } catch { }
+    }
+}
+
 function Invoke-SqlCpySchemaOnlyDatabaseCopy {
 <#
 .SYNOPSIS
@@ -550,7 +739,8 @@ function Invoke-SqlCpySchemaOnlyDatabaseCopy {
                 -DatabaseName     $db `
                 -OutputFolder     $dbFolder `
                 -CombinedPath     $combinedPath `
-                -IncludeObjectTypes $IncludeObjectTypes
+                -IncludeObjectTypes $IncludeObjectTypes `
+                -Config           $Config
         } catch {
             Write-SqlCpyWarning "Scripting for $db failed: $($_.Exception.Message)"
             Write-SqlCpyInfo   (Get-SqlCpyConnectionErrorHint -Message $_.Exception.Message -Config $Config)
@@ -612,6 +802,13 @@ function Export-SqlCpySchemaOnlyDatabase {
 .PARAMETER IncludeObjectTypes
     Categories to include; entries not listed in the phase map are logged and
     skipped.
+
+.PARAMETER Config
+    Optional config hashtable. When supplied, honours
+    SchemaOnlyTableScriptMode, SchemaOnlyExcludeTables, and
+    SchemaOnlyTableScriptTimeoutSeconds for the Tables phase. When omitted,
+    the Tables phase uses the legacy whole-collection path (no per-table
+    timeout, no skip list).
 #>
     [CmdletBinding()]
     param(
@@ -619,8 +816,42 @@ function Export-SqlCpySchemaOnlyDatabase {
         [Parameter(Mandatory)] [string]$DatabaseName,
         [Parameter(Mandatory)] [string]$OutputFolder,
         [Parameter(Mandatory)] [string]$CombinedPath,
-        [Parameter(Mandatory)] [string[]]$IncludeObjectTypes
+        [Parameter(Mandatory)] [string[]]$IncludeObjectTypes,
+        [hashtable]$Config
     )
+
+    # Resolve per-table scripting knobs (all optional, safe defaults).
+    $tableMode    = 'PerTable'
+    $excludeList  = @()
+    $tableTimeout = 300
+    if ($Config) {
+        if ($Config.ContainsKey('SchemaOnlyTableScriptMode') -and $Config.SchemaOnlyTableScriptMode) {
+            $tableMode = [string]$Config.SchemaOnlyTableScriptMode
+        }
+        if ($Config.ContainsKey('SchemaOnlyExcludeTables') -and $Config.SchemaOnlyExcludeTables) {
+            $excludeList = @($Config.SchemaOnlyExcludeTables)
+        }
+        if ($Config.ContainsKey('SchemaOnlyTableScriptTimeoutSeconds') -and
+            $Config.SchemaOnlyTableScriptTimeoutSeconds) {
+            $parsed = 0
+            if ([int]::TryParse([string]$Config.SchemaOnlyTableScriptTimeoutSeconds, [ref]$parsed) -and $parsed -gt 0) {
+                $tableTimeout = $parsed
+            }
+        }
+    }
+
+    $skipReportPath = Join-Path -Path $OutputFolder -ChildPath '_skipped_tables.txt'
+    $skipReport     = New-Object System.Collections.Generic.List[string]
+    $skipReport.Add(("-- sqlserver-cpy schema-only: skipped tables report for {0}" -f $DatabaseName)) | Out-Null
+    $skipReport.Add(("-- Generated : {0}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))) | Out-Null
+    $skipReport.Add(("-- Mode      : {0}"  -f $tableMode)) | Out-Null
+    $skipReport.Add(("-- Timeout   : {0}s" -f $tableTimeout)) | Out-Null
+    if ($excludeList.Count -gt 0) {
+        $skipReport.Add(("-- ExcludeList: {0}" -f ($excludeList -join ', '))) | Out-Null
+    } else {
+        $skipReport.Add("-- ExcludeList: (empty)") | Out-Null
+    }
+    $skipReport.Add('') | Out-Null
 
     $db = $Connection.Databases[$DatabaseName]
     if (-not $db) {
@@ -712,7 +943,46 @@ function Export-SqlCpySchemaOnlyDatabase {
 
         $warnSink = { param($msg) Write-SqlCpyWarning $msg }
 
+        $phaseSkipped = 0
+        $phaseTimedOut = 0
+        $phaseExcluded = 0
+
         foreach ($item in $phaseItems) {
+            $itemLabel = $null
+            $itemSchema = $null
+            $itemObjectId = 0L
+            try {
+                if ($item.PSObject.Properties.Name -contains 'Schema') {
+                    $itemSchema = [string]$item.Schema
+                }
+                if ($item.PSObject.Properties.Name -contains 'ObjectId') {
+                    try { $itemObjectId = [long]$item.ObjectId } catch { $itemObjectId = 0L }
+                }
+                if ($itemSchema) {
+                    $itemLabel = ('[{0}].[{1}]' -f $itemSchema, $item.Name)
+                } else {
+                    $itemLabel = ('[{0}]' -f $item.Name)
+                }
+            } catch {
+                $itemLabel = '<unknown>'
+            }
+
+            # Tables phase: exclusion list + optional per-table timeout.
+            $useTimeout = $false
+            if ($phase.Property -eq 'Tables') {
+                if (Test-SqlCpySchemaOnlyTableExcluded -SchemaName $itemSchema -TableName ([string]$item.Name) -ObjectId $itemObjectId -ExcludeList $excludeList) {
+                    Write-SqlCpyWarning ("    [table] exclude {0} (object_id={1}) - per SchemaOnlyExcludeTables" -f $itemLabel, $itemObjectId)
+                    $skipReport.Add(("EXCLUDE {0} object_id={1}" -f $itemLabel, $itemObjectId)) | Out-Null
+                    $phaseExcluded++
+                    continue
+                }
+                if ($tableMode -eq 'PerTable') {
+                    Write-SqlCpyInfo ("    [table] scripting {0} object_id={1} (timeout={2}s)" -f $itemLabel, $itemObjectId, $tableTimeout)
+                    $useTimeout = $true
+                }
+            }
+
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
             try {
                 if ($phase.Property -eq 'Schemas') {
                     # Schemas take the dedicated helper. SMO's generic
@@ -722,17 +992,29 @@ function Export-SqlCpySchemaOnlyDatabase {
                     # then .Script(), then a manual CREATE SCHEMA ...
                     # AUTHORIZATION [dbo] (security intentionally ignored).
                     $lines = Get-SqlCpySchemaScriptLines -Schema $item -ScriptingOptions $scriptingOptions -WarningSink $warnSink
+                } elseif ($useTimeout) {
+                    $lines = Invoke-SqlCpyScriptObjectWithTimeout -Item $item -Options $scriptingOptions -TimeoutSeconds $tableTimeout
                 } else {
                     # SMO every object exposes .Script() returning a StringCollection.
                     $lines = $item.Script($scriptingOptions)
                 }
-                if ($null -eq $lines) { continue }
+                $sw.Stop()
+                if ($null -eq $lines) {
+                    if ($phase.Property -eq 'Tables') {
+                        Write-SqlCpyInfo ("    [table] done {0} in {1:n2}s - empty script" -f $itemLabel, $sw.Elapsed.TotalSeconds)
+                    }
+                    continue
+                }
                 foreach ($l in $lines) {
                     Add-Content -LiteralPath $phasePath -Value $l -Encoding UTF8
                 }
                 Add-Content -LiteralPath $phasePath -Value 'GO' -Encoding UTF8
                 $scripted++
+                if ($phase.Property -eq 'Tables') {
+                    Write-SqlCpyInfo ("    [table] done {0} in {1:n2}s ({2} lines)" -f $itemLabel, $sw.Elapsed.TotalSeconds, @($lines).Count)
+                }
             } catch {
+                $sw.Stop()
                 # Encrypted modules raise when .Script() tries to decrypt the body.
                 # Surface the object name and keep going - this is called out in
                 # DECISIONS_AND_CAVEATS.txt. Include inner exception when present
@@ -741,16 +1023,43 @@ function Export-SqlCpySchemaOnlyDatabase {
                 if ($_.Exception.InnerException) {
                     $detail += ' | inner: ' + $_.Exception.InnerException.Message
                 }
-                Write-SqlCpyWarning ("    skip {0} [{1}]: {2}" -f $item.Name, $phase.Property, $detail)
+                $timedOut = ($detail -match 'timed out after')
+                if ($phase.Property -eq 'Tables') {
+                    if ($timedOut) {
+                        Write-SqlCpyWarning ("    [table] TIMEOUT {0} object_id={1} after {2:n2}s - skipped; add to SchemaOnlyExcludeTables to silence" -f $itemLabel, $itemObjectId, $sw.Elapsed.TotalSeconds)
+                        $skipReport.Add(("TIMEOUT {0} object_id={1} after {2:n2}s" -f $itemLabel, $itemObjectId, $sw.Elapsed.TotalSeconds)) | Out-Null
+                        $phaseTimedOut++
+                    } else {
+                        Write-SqlCpyWarning ("    [table] ERROR {0} object_id={1} after {2:n2}s: {3}" -f $itemLabel, $itemObjectId, $sw.Elapsed.TotalSeconds, $detail)
+                        $skipReport.Add(("ERROR   {0} object_id={1} after {2:n2}s: {3}" -f $itemLabel, $itemObjectId, $sw.Elapsed.TotalSeconds, $detail)) | Out-Null
+                        $phaseSkipped++
+                    }
+                } else {
+                    Write-SqlCpyWarning ("    skip {0} [{1}]: {2}" -f $item.Name, $phase.Property, $detail)
+                }
             }
         }
 
-        Write-SqlCpyInfo ("  [done] {0}: scripted {1} / {2}" -f $phase.Phase, $scripted, $phaseItems.Count)
+        if ($phase.Property -eq 'Tables') {
+            Write-SqlCpyInfo ("  [done] {0}: scripted {1} / {2} (excluded={3}, timeout={4}, errors={5})" -f $phase.Phase, $scripted, $phaseItems.Count, $phaseExcluded, $phaseTimedOut, $phaseSkipped)
+        } else {
+            Write-SqlCpyInfo ("  [done] {0}: scripted {1} / {2}" -f $phase.Phase, $scripted, $phaseItems.Count)
+        }
         $totalObjects += $scripted
 
         # Append this phase to the combined file.
         $phaseText = Get-Content -LiteralPath $phasePath -Raw
         Add-Content -LiteralPath $CombinedPath -Value $phaseText -Encoding UTF8
+    }
+
+    # Emit the per-database skip / timeout / exclude report. Always write the
+    # file so operators can see at a glance that the Tables phase completed
+    # without omissions even when the list is empty.
+    try {
+        Set-Content -LiteralPath $skipReportPath -Value ($skipReport -join [Environment]::NewLine) -Encoding UTF8
+        Write-SqlCpyInfo ("Tables skip/timeout report: {0}" -f $skipReportPath)
+    } catch {
+        Write-SqlCpyWarning ("Could not write skip report '{0}': {1}" -f $skipReportPath, $_.Exception.Message)
     }
 
     Write-SqlCpyInfo ("Schema-only export complete for {0}: {1} objects, artifacts at {2}" -f $DatabaseName, $totalObjects, $OutputFolder)

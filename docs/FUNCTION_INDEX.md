@@ -174,12 +174,16 @@ commands (`Copy-DbaDbTableData`, BCP, `INSERT`s) are not invoked.
   target database with `CREATE DATABASE IF NOT EXISTS` at the top of the
   combined script. Honours `DryRun` (default `$true`). Accepts
   `-IncludeObjectTypes` for narrow runs; defaults come from
-  `Get-SqlCpySchemaOnlyObjectTypeDefaults`.
+  `Get-SqlCpySchemaOnlyObjectTypeDefaults`. The Tables phase is per-table by
+  default (`SchemaOnlyTableScriptMode = 'PerTable'`) with per-table logging,
+  a per-table timeout (`SchemaOnlyTableScriptTimeoutSeconds`, default 300s),
+  and an exclusion list (`SchemaOnlyExcludeTables`).
 - **`Export-SqlCpySchemaOnlyDatabase`** (`src/SqlServerCpy/Public/SchemaOnlyDatabase.ps1`)
   — Pure scripting pass. Given an open connection and a database name, emits
   a per-phase `.sql` file for every enabled object category plus a combined
   `<db>.sql`. Separated from the orchestrator so tests and callers can stub
-  the database object.
+  the database object. Also writes `<output>/<db>/_skipped_tables.txt`
+  recording any table excluded, timed out, or errored in the Tables phase.
 - **`New-SqlCpySchemaOnlyScriptingOption`** (`src/SqlServerCpy/Public/SchemaOnlyDatabase.ps1`)
   — Builds an SMO `ScriptingOptions` (or dbatools `New-DbaScriptingOption`
   wrapper) configured for schema + DRI + indexes + DML/FullText triggers, with
@@ -226,6 +230,19 @@ commands (`Copy-DbaDbTableData`, BCP, `INSERT`s) are not invoked.
   `AUTHORIZATION [dbo]` because the schema-only copy intentionally ignores
   security; replaying the source owner would require principals that by
   design are not being copied.
+- **`Test-SqlCpySchemaOnlyTableExcluded`** (`src/SqlServerCpy/Public/SchemaOnlyDatabase.ps1`)
+  — Pure predicate used by the Tables phase to decide whether a table matches
+  `SchemaOnlyExcludeTables`. Accepts `[schema].[table]`, `schema.table`, bare
+  `table` (any schema), or a numeric `object_id`; matching is case-insensitive
+  and tolerates bracket characters.
+- **`Invoke-SqlCpyScriptObjectWithTimeout`** (`src/SqlServerCpy/Public/SchemaOnlyDatabase.ps1`)
+  — Runs `$item.Script($options)` in an isolated PowerShell runspace with a
+  wall-clock timeout. Returns the script lines on success, throws
+  `Script call timed out after Ns` on deadline. Used by the Tables phase
+  when `SchemaOnlyTableScriptMode = 'PerTable'` so a hung single-table
+  SMO call does not block the whole copy. Best-effort: managed code is
+  stopped cleanly but native SqlClient socket reads may linger until
+  process teardown.
 
 ## Planned (not in this scaffold)
 

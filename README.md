@@ -288,10 +288,50 @@ an empty target. In **DryRun** the artifacts are produced but not applied.
 Config knobs in `config/default.psd1`:
 
 ```powershell
-SchemaOnlyDatabaseList       = @()      # which databases to copy
-SchemaOnlyIncludeObjectTypes = $null    # $null = use the full defaults
-SchemaOnlyExcludeSecurity    = $true    # always true by design
+SchemaOnlyDatabaseList              = @()          # which databases to copy
+SchemaOnlyIncludeObjectTypes        = $null        # $null = use the full defaults
+SchemaOnlyExcludeSecurity           = $true        # always true by design
+SchemaOnlyTableScriptMode           = 'PerTable'   # 'PerTable' | 'Collection'
+SchemaOnlyExcludeTables             = @()          # tables to skip in the Tables phase
+SchemaOnlyTableScriptTimeoutSeconds = 300          # per-table wall-clock timeout
 ```
+
+### Per-table scripting (Tables phase)
+
+The Tables phase iterates tables one at a time by default
+(`SchemaOnlyTableScriptMode = 'PerTable'`) and logs the schema-qualified
+name and `object_id` before and after each table with elapsed time:
+
+```
+[table] scripting [integra].[Execution] object_id=295672101 (timeout=300s)
+[table] done      [integra].[Execution] in 3.21s (128 lines)
+```
+
+Why this is the default: SMO's `.Script($opts)` path on a single table can
+hang when the server-side metadata query against `sys.indexes` for that
+table never returns. On one observed source the tables
+`[integra].[Execution]` and `[integra].[Application]` hang indefinitely
+with no `blocking_session_id`. Per-table mode ensures every other table
+still gets scripted, and the wall-clock timeout (300s default) skips the
+offender so the run completes. Skipped tables are recorded in
+`<output>/<db>/_skipped_tables.txt`.
+
+**Running into this?** Add the offenders to `config/local.psd1`:
+
+```powershell
+SchemaOnlyExcludeTables = @('[integra].[Execution]', '[integra].[Application]')
+```
+
+Entries may be written as `[schema].[table]`, `schema.table`, bare `table`
+(matches any schema), or a numeric `object_id`. Matching is
+case-insensitive.
+
+**Timeout caveat.** The per-table timeout runs `.Script()` in a child
+PowerShell runspace and stops that runspace when the deadline elapses.
+This is *best-effort*: managed code is stopped cleanly, but if SMO is
+blocked inside a native SqlClient socket read the underlying TCP call may
+linger in the background until the OS tears the process down. The main
+runspace is freed either way, so the schema-only copy finishes.
 
 ### Caveats
 
