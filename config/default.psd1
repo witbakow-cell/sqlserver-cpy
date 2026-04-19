@@ -69,17 +69,31 @@
     SchemaOnlyExcludeSecurity = $true
 
     # Schema-only copy: how the Tables phase emits scripts.
-    #   'PerTable'   - iterate tables one at a time, log before/after with
-    #                  [schema].[table] object_id=... and elapsed seconds, and
+    #   'InProcess'  - (default) iterate tables one at a time in the main
+    #                  runspace, reusing the already-connected SMO database.
+    #                  Logs before/after each table with [schema].[table]
+    #                  object_id=... and elapsed seconds. No hard per-table
+    #                  timeout (a hung single table would hang the phase).
+    #                  This mode has much lower overhead than 'Isolated' and
+    #                  is the right default for healthy sources.
+    #   'FastPerTable' - alias for 'InProcess'.
+    #   'PerTable'   - alias for 'InProcess' (kept for backward compatibility
+    #                  with earlier configs that used the old name). The
+    #                  previous meaning of 'PerTable' was isolated/timeout
+    #                  per table; that behaviour is now 'Isolated'.
+    #   'Isolated'   - opt-in: iterate tables one at a time, run each
+    #                  $table.Script() in a child PowerShell runspace, and
     #                  apply SchemaOnlyTableScriptTimeoutSeconds per table.
-    #                  Required when any single table hangs SMO (observed on
-    #                  [integra].[Execution] / [integra].[Application] on some
-    #                  SQL 2022 sources - the sys.indexes metadata query issued
-    #                  by SMO does not return). This is the default.
+    #                  Use when a single pathological table hangs SMO (e.g.
+    #                  the sys.indexes metadata query never returns). This
+    #                  mode is dramatically slower (tens of seconds to a few
+    #                  minutes of overhead per table for runspace setup and
+    #                  SMO re-serialization) and should only be enabled when
+    #                  needed.
     #   'Collection' - legacy behaviour: iterate $db.Tables in one go. Faster
     #                  in aggregate but a single pathological table can block
     #                  the whole phase with no progress output.
-    SchemaOnlyTableScriptMode = 'PerTable'
+    SchemaOnlyTableScriptMode = 'InProcess'
 
     # Schema-only copy: tables to skip during the Tables phase. Entries are
     # matched case-insensitively and accept any of these forms:
@@ -95,12 +109,15 @@
     SchemaOnlyExcludeTables = @()
 
     # Schema-only copy: timeout applied per table when
-    # SchemaOnlyTableScriptMode = 'PerTable'. The table script call runs in an
-    # isolated PowerShell runspace; if .Script($opts) does not return inside
-    # this many seconds the runspace is stopped, the table is recorded in the
-    # skip report, and the phase continues. Best-effort - SMO/.NET may still
-    # be blocked on native socket I/O inside the stopped runspace, but the
-    # main thread is freed and the run completes.
+    # SchemaOnlyTableScriptMode = 'Isolated'. The table script call runs in
+    # an isolated PowerShell runspace; if .Script($opts) does not return
+    # inside this many seconds the runspace is stopped, the table is
+    # recorded in the skip report, and the phase continues. Best-effort -
+    # SMO/.NET may still be blocked on native socket I/O inside the stopped
+    # runspace, but the main thread is freed and the run completes.
+    #
+    # IMPORTANT: this setting has NO EFFECT in the default 'InProcess' mode.
+    # A hard per-table timeout requires the isolated mode's child runspace.
     SchemaOnlyTableScriptTimeoutSeconds = 300
 
     # SSIS catalog scope. $null = all folders.

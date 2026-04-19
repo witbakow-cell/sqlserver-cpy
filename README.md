@@ -288,50 +288,89 @@ an empty target. In **DryRun** the artifacts are produced but not applied.
 Config knobs in `config/default.psd1`:
 
 ```powershell
-SchemaOnlyDatabaseList              = @()          # which databases to copy
-SchemaOnlyIncludeObjectTypes        = $null        # $null = use the full defaults
-SchemaOnlyExcludeSecurity           = $true        # always true by design
-SchemaOnlyTableScriptMode           = 'PerTable'   # 'PerTable' | 'Collection'
-SchemaOnlyExcludeTables             = @()          # tables to skip in the Tables phase
-SchemaOnlyTableScriptTimeoutSeconds = 300          # per-table wall-clock timeout
+SchemaOnlyDatabaseList              = @()           # which databases to copy
+SchemaOnlyIncludeObjectTypes        = $null         # $null = use the full defaults
+SchemaOnlyExcludeSecurity           = $true         # always true by design
+SchemaOnlyTableScriptMode           = 'InProcess'   # 'InProcess' (default) | 'Isolated' | 'Collection'
+SchemaOnlyExcludeTables             = @()           # tables to skip in the Tables phase
+SchemaOnlyTableScriptTimeoutSeconds = 300           # per-table timeout — ONLY applies to 'Isolated' mode
 ```
 
 ### Per-table scripting (Tables phase)
 
-The Tables phase iterates tables one at a time by default
-(`SchemaOnlyTableScriptMode = 'PerTable'`) and logs the schema-qualified
-name and `object_id` before and after each table with elapsed time:
+The Tables phase supports three modes:
+
+- **`InProcess`** (default, recommended). Iterates tables one at a time
+  in the main runspace, reusing the already-connected SMO `Database`
+  and `Table` objects. Logs before/after each table with the schema
+  name, real `object_id` (queried up front from `sys.tables`), and
+  elapsed seconds. No hard per-table timeout. This has much lower
+  overhead than `Isolated` — on healthy sources a table that SMO
+  scripts in 2-4 s stays at 2-4 s, whereas `Isolated` was observed to
+  push it to 80-250 s because of child-runspace setup, SMO re-probe,
+  and cross-runspace serialization.
+- **`Isolated`** (opt-in, slow). Same iteration, but runs each
+  `$table.Script()` inside a child PowerShell runspace and aborts the
+  runspace when `SchemaOnlyTableScriptTimeoutSeconds` elapses. Use
+  only when a single table is known to hang SMO (the
+  `sys.indexes` metadata query against
+  `[integra].[Execution]` / `[integra].[Application]` was the original
+  motivating case). The runspace-abort is best-effort: native SqlClient
+  socket reads may linger until process teardown, but the main thread
+  is freed.
+- **`Collection`** (legacy). Calls `$db.Tables` in one go. Fast in
+  aggregate but a single pathological table blocks the whole phase
+  with no progress output.
+
+Aliases: `'FastPerTable'` and the legacy `'PerTable'` both normalize to
+`'InProcess'` (the previous `'PerTable'` default was isolated + timeout
+and proved too slow in practice). Unknown values fall back to
+`'InProcess'` and emit an info line.
+
+Example log lines (default `InProcess` mode):
 
 ```
-[table] scripting [integra].[Execution] object_id=295672101 (timeout=300s)
-[table] done      [integra].[Execution] in 3.21s (128 lines)
+[tables] phase starting: count=412 mode=InProcess excluded_config=0
+[tables] fast in-process mode: no hard per-table timeout (timeout only applies in 'Isolated' mode)
+  [table] scripting [integra].[Execution] object_id=295672101
+  [table] done      [integra].[Execution] in 3.21s (128 lines)
+  ...
+[done] 13_Tables: scripted 408 / 412 (excluded=2, timeout=0, errors=2) in 312.44s; phase-file flush=0.08s
+[tables] phase done in 312.44s
+[combine] 13_Tables: appended 1284203 chars in 0.17s
 ```
 
-Why this is the default: SMO's `.Script($opts)` path on a single table can
-hang when the server-side metadata query against `sys.indexes` for that
-table never returns. On one observed source the tables
-`[integra].[Execution]` and `[integra].[Application]` hang indefinitely
-with no `blocking_session_id`. Per-table mode ensures every other table
-still gets scripted, and the wall-clock timeout (300s default) skips the
-offender so the run completes. Skipped tables are recorded in
-`<output>/<db>/_skipped_tables.txt`.
+**Running into pathological tables?** Two options:
 
-**Running into this?** Add the offenders to `config/local.psd1`:
+1. Add them to `SchemaOnlyExcludeTables` in `config/local.psd1`:
 
-```powershell
-SchemaOnlyExcludeTables = @('[integra].[Execution]', '[integra].[Application]')
-```
+   ```powershell
+   SchemaOnlyExcludeTables = @('[integra].[Execution]', '[integra].[Application]')
+   ```
 
-Entries may be written as `[schema].[table]`, `schema.table`, bare `table`
-(matches any schema), or a numeric `object_id`. Matching is
-case-insensitive.
+   Entries may be written as `[schema].[table]`, `schema.table`, bare `table`
+   (matches any schema), or a numeric `object_id`. Matching is
+   case-insensitive.
 
-**Timeout caveat.** The per-table timeout runs `.Script()` in a child
-PowerShell runspace and stops that runspace when the deadline elapses.
-This is *best-effort*: managed code is stopped cleanly, but if SMO is
-blocked inside a native SqlClient socket read the underlying TCP call may
-linger in the background until the OS tears the process down. The main
-runspace is freed either way, so the schema-only copy finishes.
+2. Switch to `'Isolated'` mode if you want the timeout-and-continue
+   behaviour to catch unknown offenders automatically:
+
+   ```powershell
+   SchemaOnlyTableScriptMode           = 'Isolated'
+   SchemaOnlyTableScriptTimeoutSeconds = 300
+   ```
+
+   Accept that this mode adds significant per-table overhead even for
+   healthy tables.
+
+**Timeout caveat (Isolated mode only).** The per-table timeout runs
+`.Script()` in a child PowerShell runspace and stops that runspace when
+the deadline elapses. This is *best-effort*: managed code is stopped
+cleanly, but if SMO is blocked inside a native SqlClient socket read
+the underlying TCP call may linger in the background until the OS tears
+the process down. The main runspace is freed either way, so the
+schema-only copy finishes. `SchemaOnlyTableScriptTimeoutSeconds` has
+**no effect** in `'InProcess'` mode.
 
 ### Caveats
 

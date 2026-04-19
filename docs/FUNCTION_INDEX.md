@@ -174,10 +174,14 @@ commands (`Copy-DbaDbTableData`, BCP, `INSERT`s) are not invoked.
   target database with `CREATE DATABASE IF NOT EXISTS` at the top of the
   combined script. Honours `DryRun` (default `$true`). Accepts
   `-IncludeObjectTypes` for narrow runs; defaults come from
-  `Get-SqlCpySchemaOnlyObjectTypeDefaults`. The Tables phase is per-table by
-  default (`SchemaOnlyTableScriptMode = 'PerTable'`) with per-table logging,
-  a per-table timeout (`SchemaOnlyTableScriptTimeoutSeconds`, default 300s),
-  and an exclusion list (`SchemaOnlyExcludeTables`).
+  `Get-SqlCpySchemaOnlyObjectTypeDefaults`. The Tables phase is fast
+  in-process by default (`SchemaOnlyTableScriptMode = 'InProcess'`) with
+  before/after per-table logging, a pre-computed `object_id` map (so log
+  lines show real IDs, not 0), parent-side phase-start/phase-done/combine
+  timing lines, and an exclusion list (`SchemaOnlyExcludeTables`). Switch
+  to `SchemaOnlyTableScriptMode = 'Isolated'` to get
+  `SchemaOnlyTableScriptTimeoutSeconds` (default 300s) enforced via a
+  child PowerShell runspace — significantly slower, best-effort cancel.
 - **`Export-SqlCpySchemaOnlyDatabase`** (`src/SqlServerCpy/Public/SchemaOnlyDatabase.ps1`)
   — Pure scripting pass. Given an open connection and a database name, emits
   a per-phase `.sql` file for every enabled object category plus a combined
@@ -239,10 +243,25 @@ commands (`Copy-DbaDbTableData`, BCP, `INSERT`s) are not invoked.
   — Runs `$item.Script($options)` in an isolated PowerShell runspace with a
   wall-clock timeout. Returns the script lines on success, throws
   `Script call timed out after Ns` on deadline. Used by the Tables phase
-  when `SchemaOnlyTableScriptMode = 'PerTable'` so a hung single-table
-  SMO call does not block the whole copy. Best-effort: managed code is
-  stopped cleanly but native SqlClient socket reads may linger until
-  process teardown.
+  only when `SchemaOnlyTableScriptMode = 'Isolated'` (opt-in) so a hung
+  single-table SMO call does not block the whole copy. Best-effort:
+  managed code is stopped cleanly but native SqlClient socket reads may
+  linger until process teardown. Not used in the default `'InProcess'`
+  mode.
+- **`Resolve-SqlCpySchemaOnlyTableMode`** (`src/SqlServerCpy/Public/SchemaOnlyDatabase.ps1`)
+  — Normalizes `SchemaOnlyTableScriptMode` strings. Accepts (case-
+  insensitive) `InProcess`, `FastPerTable`, legacy `PerTable`,
+  `Isolated`, `Collection`. `InProcess`/`FastPerTable`/`PerTable` all
+  normalize to `InProcess`; unknown values fall back to `InProcess`.
+  Kept as a pure helper so tests can assert the alias mapping without
+  SQL Server.
+- **`Get-SqlCpyDatabaseObjectIdMap`** (`src/SqlServerCpy/Public/SchemaOnlyDatabase.ps1`)
+  — Issues one `sys.tables`/`sys.schemas` query via `Invoke-DbaQuery` and
+  returns a hashtable mapping lower-cased `[schema].[table]` to
+  `object_id`. The Tables phase uses it as a fallback when `$table.ID` /
+  `$table.ObjectId` return 0 so log lines show real object_ids. Returns
+  an empty hashtable if `Invoke-DbaQuery` is unavailable or the query
+  fails; callers log `object_id=-` in that case.
 
 ## Planned (not in this scaffold)
 

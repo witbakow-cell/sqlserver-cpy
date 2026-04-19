@@ -540,6 +540,119 @@ function Test-SqlCpySchemaOnlyTableExcluded {
     return $false
 }
 
+function Resolve-SqlCpySchemaOnlyTableMode {
+<#
+.SYNOPSIS
+    Normalizes the SchemaOnlyTableScriptMode config value.
+
+.DESCRIPTION
+    Accepted inputs (case-insensitive):
+      'InProcess'      -> 'InProcess'     (default fast path)
+      'FastPerTable'   -> 'InProcess'     (alias)
+      'PerTable'       -> 'InProcess'     (legacy alias; previous default
+                                           used isolated runspaces per table
+                                           which proved very slow in practice -
+                                           'PerTable' now means "fast per-table
+                                           in-process" with before/after logs
+                                           and no hard timeout)
+      'Isolated'       -> 'Isolated'      (opt-in child-runspace timeout mode)
+      'Collection'     -> 'Collection'    (legacy whole-collection scripter)
+    Anything else falls back to 'InProcess' and a warning is emitted.
+
+.OUTPUTS
+    [string] one of: InProcess | Isolated | Collection
+#>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [string]$Mode
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Mode)) { return 'InProcess' }
+    switch ($Mode.Trim().ToLowerInvariant()) {
+        'inprocess'    { return 'InProcess' }
+        'fastpertable' { return 'InProcess' }
+        'pertable'     { return 'InProcess' }
+        'isolated'     { return 'Isolated' }
+        'collection'   { return 'Collection' }
+        default        { return 'InProcess' }
+    }
+}
+
+function Get-SqlCpyDatabaseObjectIdMap {
+<#
+.SYNOPSIS
+    Returns a hashtable mapping '[schema].[table]' (lower-cased, bracketed) to
+    sys.objects.object_id for every user table in the given database.
+
+.DESCRIPTION
+    SMO `Table.ObjectId` was observed to be 0 across runspace boundaries and,
+    in some dbatools builds, directly on the Table object itself. To keep log
+    lines useful we issue a single metadata query up front and look up the
+    object_id by bracketed, lower-cased '[schema].[table]' key. Zero or
+    missing means "unknown"; callers format it as - in logs.
+
+    The query is best-effort: if Invoke-DbaQuery is not available or the
+    query fails the helper returns an empty hashtable and the caller prints
+    object_id=- rather than 0.
+
+.PARAMETER Connection
+    dbatools connection object (Connect-DbaInstance result).
+
+.PARAMETER DatabaseName
+    Database to query.
+
+.PARAMETER Config
+    Module config used only for splatting instance-level parameters.
+
+.OUTPUTS
+    [hashtable]
+#>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)] $Connection,
+        [Parameter(Mandatory)] [string]$DatabaseName,
+        [hashtable]$Config
+    )
+
+    $map = @{}
+    if (-not (Get-Command -Name Invoke-DbaQuery -ErrorAction SilentlyContinue)) {
+        return $map
+    }
+
+    $splat = @{ SqlInstance = $Connection }
+    if (Get-Command -Name Get-SqlCpyInstanceSplat -ErrorAction SilentlyContinue) {
+        try {
+            $splat = Get-SqlCpyInstanceSplat -Config $Config -Connection $Connection -CommandName 'Invoke-DbaQuery'
+        } catch {
+            $splat = @{ SqlInstance = $Connection }
+        }
+    }
+
+    $query = @"
+SELECT s.name AS SchemaName, t.name AS TableName, t.object_id AS ObjectId
+FROM   sys.tables t
+JOIN   sys.schemas s ON s.schema_id = t.schema_id
+WHERE  t.is_ms_shipped = 0
+"@
+
+    try {
+        $rows = Invoke-DbaQuery @splat -Database $DatabaseName -Query $query -EnableException
+        foreach ($r in $rows) {
+            $s = [string]$r.SchemaName
+            $t = [string]$r.TableName
+            if ([string]::IsNullOrWhiteSpace($s) -or [string]::IsNullOrWhiteSpace($t)) { continue }
+            $key = ('[{0}].[{1}]' -f $s.ToLowerInvariant(), $t.ToLowerInvariant())
+            $map[$key] = [long]$r.ObjectId
+        }
+    } catch {
+        # Leave map empty; caller logs object_id=- rather than 0.
+    }
+
+    return $map
+}
+
 function Invoke-SqlCpyScriptObjectWithTimeout {
 <#
 .SYNOPSIS
@@ -821,12 +934,12 @@ function Export-SqlCpySchemaOnlyDatabase {
     )
 
     # Resolve per-table scripting knobs (all optional, safe defaults).
-    $tableMode    = 'PerTable'
+    $rawMode      = $null
     $excludeList  = @()
     $tableTimeout = 300
     if ($Config) {
         if ($Config.ContainsKey('SchemaOnlyTableScriptMode') -and $Config.SchemaOnlyTableScriptMode) {
-            $tableMode = [string]$Config.SchemaOnlyTableScriptMode
+            $rawMode = [string]$Config.SchemaOnlyTableScriptMode
         }
         if ($Config.ContainsKey('SchemaOnlyExcludeTables') -and $Config.SchemaOnlyExcludeTables) {
             $excludeList = @($Config.SchemaOnlyExcludeTables)
@@ -838,6 +951,10 @@ function Export-SqlCpySchemaOnlyDatabase {
                 $tableTimeout = $parsed
             }
         }
+    }
+    $tableMode = Resolve-SqlCpySchemaOnlyTableMode -Mode $rawMode
+    if ($rawMode -and $rawMode -ne $tableMode) {
+        Write-SqlCpyInfo ("Tables: SchemaOnlyTableScriptMode '{0}' normalized to '{1}'." -f $rawMode, $tableMode)
     }
 
     $skipReportPath = Join-Path -Path $OutputFolder -ChildPath '_skipped_tables.txt'
@@ -856,6 +973,18 @@ function Export-SqlCpySchemaOnlyDatabase {
     $db = $Connection.Databases[$DatabaseName]
     if (-not $db) {
         throw "Database '$DatabaseName' not found on source instance."
+    }
+
+    # Query sys.tables once to get real object_ids. SMO Table.ObjectId was
+    # observed to be 0 in logs (possibly a dbatools wrapper issue or a
+    # cross-runspace serialization artefact). The map keys are lower-cased
+    # '[schema].[table]' strings.
+    $objectIdMap = @{}
+    try {
+        $objectIdMap = Get-SqlCpyDatabaseObjectIdMap -Connection $Connection -DatabaseName $DatabaseName -Config $Config
+        Write-SqlCpyInfo ("Tables: resolved {0} object_id mappings via sys.tables." -f $objectIdMap.Count)
+    } catch {
+        Write-SqlCpyWarning ("Tables: could not resolve object_id mappings via sys.tables ({0}); log entries will show object_id=-." -f $_.Exception.Message)
     }
 
     $scriptingOptions = New-SqlCpySchemaOnlyScriptingOption
@@ -938,14 +1067,32 @@ function Export-SqlCpySchemaOnlyDatabase {
 
         $scripted = 0
         $phaseHeader = ("-- Phase {0} ({1}): {2}" -f $phase.Phase, $phase.Property, $phase.Description)
-        Set-Content -LiteralPath $phasePath -Value $phaseHeader -Encoding UTF8
-        Add-Content -LiteralPath $phasePath -Value '' -Encoding UTF8
+
+        # Buffer phase output in memory and flush once at the end. Per-line
+        # Add-Content on every table line was a major driver of the "parent-
+        # side gap" the user observed on large schemas (open/close/flush per
+        # line adds up to many seconds per table on real filesystems).
+        $phaseBuffer = New-Object System.Text.StringBuilder
+        [void]$phaseBuffer.AppendLine($phaseHeader)
+        [void]$phaseBuffer.AppendLine('')
 
         $warnSink = { param($msg) Write-SqlCpyWarning $msg }
 
         $phaseSkipped = 0
         $phaseTimedOut = 0
         $phaseExcluded = 0
+
+        $phaseIsTables = ($phase.Property -eq 'Tables')
+        $phaseSw = $null
+        if ($phaseIsTables) {
+            $phaseSw = [System.Diagnostics.Stopwatch]::StartNew()
+            Write-SqlCpyInfo ("  [tables] phase starting: count={0} mode={1} excluded_config={2}" -f $phaseItems.Count, $tableMode, $excludeList.Count)
+            if ($tableMode -eq 'Isolated') {
+                Write-SqlCpyInfo ("  [tables] isolated mode: per-table timeout={0}s (child runspace; slower, best-effort cancel)" -f $tableTimeout)
+            } else {
+                Write-SqlCpyInfo ("  [tables] fast in-process mode: no hard per-table timeout (timeout only applies in 'Isolated' mode)")
+            }
+        }
 
         foreach ($item in $phaseItems) {
             $itemLabel = $null
@@ -955,7 +1102,10 @@ function Export-SqlCpySchemaOnlyDatabase {
                 if ($item.PSObject.Properties.Name -contains 'Schema') {
                     $itemSchema = [string]$item.Schema
                 }
-                if ($item.PSObject.Properties.Name -contains 'ObjectId') {
+                if ($item.PSObject.Properties.Name -contains 'ID') {
+                    try { $itemObjectId = [long]$item.ID } catch { $itemObjectId = 0L }
+                }
+                if ($itemObjectId -le 0 -and $item.PSObject.Properties.Name -contains 'ObjectId') {
                     try { $itemObjectId = [long]$item.ObjectId } catch { $itemObjectId = 0L }
                 }
                 if ($itemSchema) {
@@ -967,18 +1117,27 @@ function Export-SqlCpySchemaOnlyDatabase {
                 $itemLabel = '<unknown>'
             }
 
+            # Fall back to the pre-computed map when SMO hands us object_id=0.
+            if ($phaseIsTables -and $itemObjectId -le 0 -and $objectIdMap -and $objectIdMap.Count -gt 0 -and $itemSchema) {
+                $key = ('[{0}].[{1}]' -f ([string]$itemSchema).ToLowerInvariant(), ([string]$item.Name).ToLowerInvariant())
+                if ($objectIdMap.ContainsKey($key)) { $itemObjectId = [long]$objectIdMap[$key] }
+            }
+            $oidDisplay = if ($itemObjectId -gt 0) { $itemObjectId.ToString() } else { '-' }
+
             # Tables phase: exclusion list + optional per-table timeout.
             $useTimeout = $false
-            if ($phase.Property -eq 'Tables') {
+            if ($phaseIsTables) {
                 if (Test-SqlCpySchemaOnlyTableExcluded -SchemaName $itemSchema -TableName ([string]$item.Name) -ObjectId $itemObjectId -ExcludeList $excludeList) {
-                    Write-SqlCpyWarning ("    [table] exclude {0} (object_id={1}) - per SchemaOnlyExcludeTables" -f $itemLabel, $itemObjectId)
-                    $skipReport.Add(("EXCLUDE {0} object_id={1}" -f $itemLabel, $itemObjectId)) | Out-Null
+                    Write-SqlCpyWarning ("    [table] exclude {0} (object_id={1}) - per SchemaOnlyExcludeTables" -f $itemLabel, $oidDisplay)
+                    $skipReport.Add(("EXCLUDE {0} object_id={1}" -f $itemLabel, $oidDisplay)) | Out-Null
                     $phaseExcluded++
                     continue
                 }
-                if ($tableMode -eq 'PerTable') {
-                    Write-SqlCpyInfo ("    [table] scripting {0} object_id={1} (timeout={2}s)" -f $itemLabel, $itemObjectId, $tableTimeout)
+                if ($tableMode -eq 'Isolated') {
+                    Write-SqlCpyInfo ("    [table] scripting {0} object_id={1} (isolated, timeout={2}s)" -f $itemLabel, $oidDisplay, $tableTimeout)
                     $useTimeout = $true
+                } else {
+                    Write-SqlCpyInfo ("    [table] scripting {0} object_id={1}" -f $itemLabel, $oidDisplay)
                 }
             }
 
@@ -996,21 +1155,24 @@ function Export-SqlCpySchemaOnlyDatabase {
                     $lines = Invoke-SqlCpyScriptObjectWithTimeout -Item $item -Options $scriptingOptions -TimeoutSeconds $tableTimeout
                 } else {
                     # SMO every object exposes .Script() returning a StringCollection.
+                    # The fast in-process path reuses the already-connected
+                    # SMO object - no child runspace, no reconnect overhead.
                     $lines = $item.Script($scriptingOptions)
                 }
                 $sw.Stop()
                 if ($null -eq $lines) {
-                    if ($phase.Property -eq 'Tables') {
+                    if ($phaseIsTables) {
                         Write-SqlCpyInfo ("    [table] done {0} in {1:n2}s - empty script" -f $itemLabel, $sw.Elapsed.TotalSeconds)
                     }
                     continue
                 }
+                # Buffer rather than Add-Content per line.
                 foreach ($l in $lines) {
-                    Add-Content -LiteralPath $phasePath -Value $l -Encoding UTF8
+                    [void]$phaseBuffer.AppendLine([string]$l)
                 }
-                Add-Content -LiteralPath $phasePath -Value 'GO' -Encoding UTF8
+                [void]$phaseBuffer.AppendLine('GO')
                 $scripted++
-                if ($phase.Property -eq 'Tables') {
+                if ($phaseIsTables) {
                     Write-SqlCpyInfo ("    [table] done {0} in {1:n2}s ({2} lines)" -f $itemLabel, $sw.Elapsed.TotalSeconds, @($lines).Count)
                 }
             } catch {
@@ -1024,14 +1186,14 @@ function Export-SqlCpySchemaOnlyDatabase {
                     $detail += ' | inner: ' + $_.Exception.InnerException.Message
                 }
                 $timedOut = ($detail -match 'timed out after')
-                if ($phase.Property -eq 'Tables') {
+                if ($phaseIsTables) {
                     if ($timedOut) {
-                        Write-SqlCpyWarning ("    [table] TIMEOUT {0} object_id={1} after {2:n2}s - skipped; add to SchemaOnlyExcludeTables to silence" -f $itemLabel, $itemObjectId, $sw.Elapsed.TotalSeconds)
-                        $skipReport.Add(("TIMEOUT {0} object_id={1} after {2:n2}s" -f $itemLabel, $itemObjectId, $sw.Elapsed.TotalSeconds)) | Out-Null
+                        Write-SqlCpyWarning ("    [table] TIMEOUT {0} object_id={1} after {2:n2}s - skipped; add to SchemaOnlyExcludeTables to silence" -f $itemLabel, $oidDisplay, $sw.Elapsed.TotalSeconds)
+                        $skipReport.Add(("TIMEOUT {0} object_id={1} after {2:n2}s" -f $itemLabel, $oidDisplay, $sw.Elapsed.TotalSeconds)) | Out-Null
                         $phaseTimedOut++
                     } else {
-                        Write-SqlCpyWarning ("    [table] ERROR {0} object_id={1} after {2:n2}s: {3}" -f $itemLabel, $itemObjectId, $sw.Elapsed.TotalSeconds, $detail)
-                        $skipReport.Add(("ERROR   {0} object_id={1} after {2:n2}s: {3}" -f $itemLabel, $itemObjectId, $sw.Elapsed.TotalSeconds, $detail)) | Out-Null
+                        Write-SqlCpyWarning ("    [table] ERROR {0} object_id={1} after {2:n2}s: {3}" -f $itemLabel, $oidDisplay, $sw.Elapsed.TotalSeconds, $detail)
+                        $skipReport.Add(("ERROR   {0} object_id={1} after {2:n2}s: {3}" -f $itemLabel, $oidDisplay, $sw.Elapsed.TotalSeconds, $detail)) | Out-Null
                         $phaseSkipped++
                     }
                 } else {
@@ -1040,16 +1202,27 @@ function Export-SqlCpySchemaOnlyDatabase {
             }
         }
 
-        if ($phase.Property -eq 'Tables') {
-            Write-SqlCpyInfo ("  [done] {0}: scripted {1} / {2} (excluded={3}, timeout={4}, errors={5})" -f $phase.Phase, $scripted, $phaseItems.Count, $phaseExcluded, $phaseTimedOut, $phaseSkipped)
+        # Flush the buffered phase once.
+        $flushSw = [System.Diagnostics.Stopwatch]::StartNew()
+        $phaseText = $phaseBuffer.ToString()
+        Set-Content -LiteralPath $phasePath -Value $phaseText -Encoding UTF8
+        $flushSw.Stop()
+
+        if ($phaseIsTables) {
+            $phaseSw.Stop()
+            Write-SqlCpyInfo ("  [done] {0}: scripted {1} / {2} (excluded={3}, timeout={4}, errors={5}) in {6:n2}s; phase-file flush={7:n2}s" -f $phase.Phase, $scripted, $phaseItems.Count, $phaseExcluded, $phaseTimedOut, $phaseSkipped, $phaseSw.Elapsed.TotalSeconds, $flushSw.Elapsed.TotalSeconds)
+            Write-SqlCpyInfo ("  [tables] phase done in {0:n2}s" -f $phaseSw.Elapsed.TotalSeconds)
         } else {
             Write-SqlCpyInfo ("  [done] {0}: scripted {1} / {2}" -f $phase.Phase, $scripted, $phaseItems.Count)
         }
         $totalObjects += $scripted
 
-        # Append this phase to the combined file.
-        $phaseText = Get-Content -LiteralPath $phasePath -Raw
+        # Append this phase to the combined file. Timed so the log surfaces
+        # any I/O stall during combine, which was otherwise invisible.
+        $combineSw = [System.Diagnostics.Stopwatch]::StartNew()
         Add-Content -LiteralPath $CombinedPath -Value $phaseText -Encoding UTF8
+        $combineSw.Stop()
+        Write-SqlCpyInfo ("  [combine] {0}: appended {1} chars in {2:n2}s" -f $phase.Phase, $phaseText.Length, $combineSw.Elapsed.TotalSeconds)
     }
 
     # Emit the per-database skip / timeout / exclude report. Always write the

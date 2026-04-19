@@ -665,7 +665,7 @@ try {
 }
 
 if ($manifest) {
-    foreach ($fn in 'Export-SqlCpySchemaOnlyDatabase','New-SqlCpySchemaOnlyScriptingOption','Get-SqlCpySchemaOnlyObjectTypeDefaults','Get-SqlCpySchemaOnlySecurityExcludedTypes','Get-SqlCpySchemaOnlyScriptPhases','Get-SqlCpySchemaOnlyInlineOnlyTypes','Test-SqlCpySchemaOnlyTableExcluded','Invoke-SqlCpyScriptObjectWithTimeout') {
+    foreach ($fn in 'Export-SqlCpySchemaOnlyDatabase','New-SqlCpySchemaOnlyScriptingOption','Get-SqlCpySchemaOnlyObjectTypeDefaults','Get-SqlCpySchemaOnlySecurityExcludedTypes','Get-SqlCpySchemaOnlyScriptPhases','Get-SqlCpySchemaOnlyInlineOnlyTypes','Test-SqlCpySchemaOnlyTableExcluded','Invoke-SqlCpyScriptObjectWithTimeout','Resolve-SqlCpySchemaOnlyTableMode','Get-SqlCpyDatabaseObjectIdMap') {
         if ($manifest.FunctionsToExport -notcontains $fn) {
             $failures += [pscustomobject]@{
                 File = $manifestPath
@@ -691,10 +691,10 @@ try {
             Write-Host "  OK  config has $k = $($cfg3[$k])"
         }
     }
-    if ($cfg3.SchemaOnlyTableScriptMode -ne 'PerTable') {
+    if ($cfg3.SchemaOnlyTableScriptMode -ne 'InProcess') {
         $failures += [pscustomobject]@{
             File = $cfgPath
-            Errors = "SchemaOnlyTableScriptMode must default to 'PerTable'; got '$($cfg3.SchemaOnlyTableScriptMode)'"
+            Errors = "SchemaOnlyTableScriptMode must default to 'InProcess'; got '$($cfg3.SchemaOnlyTableScriptMode)'"
         }
     }
     if ($cfg3.SchemaOnlyTableScriptTimeoutSeconds -ne 300) {
@@ -794,6 +794,42 @@ try {
 }
 
 Write-Host ''
+Write-Host 'Probing Resolve-SqlCpySchemaOnlyTableMode...' -ForegroundColor Cyan
+try {
+    $modeCases = @(
+        @{ In = $null;          Expected = 'InProcess'  }
+        @{ In = '';             Expected = 'InProcess'  }
+        @{ In = '   ';          Expected = 'InProcess'  }
+        @{ In = 'InProcess';    Expected = 'InProcess'  }
+        @{ In = 'inprocess';    Expected = 'InProcess'  }
+        @{ In = 'FastPerTable'; Expected = 'InProcess'  }
+        @{ In = 'fastpertable'; Expected = 'InProcess'  }
+        @{ In = 'PerTable';     Expected = 'InProcess'  }  # legacy alias
+        @{ In = 'pertable';     Expected = 'InProcess'  }
+        @{ In = 'Isolated';     Expected = 'Isolated'   }
+        @{ In = 'ISOLATED';     Expected = 'Isolated'   }
+        @{ In = 'Collection';   Expected = 'Collection' }
+        @{ In = 'Mystery';      Expected = 'InProcess'  }  # unknown -> default
+    )
+    foreach ($m in $modeCases) {
+        $got = Resolve-SqlCpySchemaOnlyTableMode -Mode $m.In
+        if ($got -ne $m.Expected) {
+            $failures += [pscustomobject]@{
+                File = $schemaFile
+                Errors = ("Resolve-SqlCpySchemaOnlyTableMode('{0}') = '{1}', expected '{2}'" -f $m.In, $got, $m.Expected)
+            }
+        } else {
+            Write-Host ("  OK  Resolve-SqlCpySchemaOnlyTableMode('{0}') = '{1}'" -f $m.In, $got)
+        }
+    }
+} catch {
+    $failures += [pscustomobject]@{
+        File = $schemaFile
+        Errors = "Mode resolver probe failed: $($_.Exception.Message)"
+    }
+}
+
+Write-Host ''
 Write-Host 'Probing Invoke-SqlCpyScriptObjectWithTimeout...' -ForegroundColor Cyan
 try {
     # Fast path: a mock item whose Script($opts) returns quickly.
@@ -851,6 +887,38 @@ try {
     $failures += [pscustomobject]@{
         File = $schemaFile
         Errors = "Timeout helper probe failed: $($_.Exception.Message)"
+    }
+}
+
+Write-Host ''
+Write-Host 'Probing Get-SqlCpyDatabaseObjectIdMap (no-dbatools path)...' -ForegroundColor Cyan
+try {
+    # With Invoke-DbaQuery not installed in the test environment, the helper
+    # must return an empty hashtable rather than throwing.
+    $fakeConn = [pscustomobject]@{ Name = 'fake' }
+    $map = Get-SqlCpyDatabaseObjectIdMap -Connection $fakeConn -DatabaseName 'nope' -Config @{}
+    if ($null -eq $map) {
+        $failures += [pscustomobject]@{
+            File = $schemaFile
+            Errors = 'Get-SqlCpyDatabaseObjectIdMap must return an empty hashtable (not $null) when Invoke-DbaQuery is unavailable.'
+        }
+    } elseif (-not ($map -is [hashtable])) {
+        $failures += [pscustomobject]@{
+            File = $schemaFile
+            Errors = ("Get-SqlCpyDatabaseObjectIdMap must return [hashtable]; got {0}" -f $map.GetType().FullName)
+        }
+    } elseif ($map.Count -ne 0) {
+        $failures += [pscustomobject]@{
+            File = $schemaFile
+            Errors = 'Get-SqlCpyDatabaseObjectIdMap should yield an empty hashtable when Invoke-DbaQuery is absent.'
+        }
+    } else {
+        Write-Host '  OK  Get-SqlCpyDatabaseObjectIdMap returns empty hashtable without Invoke-DbaQuery'
+    }
+} catch {
+    $failures += [pscustomobject]@{
+        File = $schemaFile
+        Errors = "Object-id map probe failed: $($_.Exception.Message)"
     }
 }
 

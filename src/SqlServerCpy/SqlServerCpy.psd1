@@ -62,6 +62,8 @@
         'Get-SqlCpySchemaScriptLines'
         'Test-SqlCpySchemaOnlyTableExcluded'
         'Invoke-SqlCpyScriptObjectWithTimeout'
+        'Resolve-SqlCpySchemaOnlyTableMode'
+        'Get-SqlCpyDatabaseObjectIdMap'
     )
     CmdletsToExport   = @()
     VariablesToExport = @()
