@@ -272,6 +272,26 @@ Observations
          returned object, so missing properties are tolerated. If a
          category's collection is unavailable the phase is logged as
          skipped.
+       * Schema phase has a dedicated fallback. We observed on SQL
+         2022 / dbatools 2.1.24 (dwcontrol) that $schema.Script($opts)
+         throws
+             Script failed for Schema 'A00'.
+         for every schema, even those whose sys.schemas owner is plain
+         dbo and whose $schema.Script() / $schema.Script($opts) work
+         interactively. Get-SqlCpySchemaScriptLines tries
+         .Script($opts), then .Script(), then emits a manual
+             IF SCHEMA_ID(N'<name>') IS NULL
+                 EXEC(N'CREATE SCHEMA [<name>] AUTHORIZATION [dbo]');
+         statement via Format-SqlCpySchemaCreateStatement. The
+         AUTHORIZATION [dbo] choice is intentional and aligned with
+         the "ignore security" requirement: replaying the source owner
+         would drag in principals that the schema-only copy refuses to
+         script. Names are escaped for both string-literal ('' doubling)
+         and bracket-identifier (]] doubling) forms, so schemas like
+         O'Brien, weird]name, or $money round-trip correctly. When the
+         manual fallback is used the module logs a WARN line with the
+         inner SMO exception so the underlying SMO failure is still
+         visible.
        * DryRun is the default and the artifacts are written anyway,
          so the user can review exactly what would be applied before
          flipping DryRun off.

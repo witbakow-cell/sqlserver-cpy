@@ -250,6 +250,184 @@ function Get-SqlCpySchemaOnlyScriptPhases {
     )
 }
 
+function Get-SqlCpySchemaOnlySystemSchemaNames {
+<#
+.SYNOPSIS
+    Returns the schema names that schema-only copy must never emit because
+    SQL Server ships them (or creates them automatically for built-in roles).
+
+.DESCRIPTION
+    Kept as a dedicated helper so the schema-phase fallback and any future
+    callers share one list. `dbo`, `guest`, `INFORMATION_SCHEMA`, and `sys`
+    are the system schemas; the `db_*` fixed-role schemas are created by SQL
+    Server with the database and must not be scripted either.
+
+.OUTPUTS
+    [string[]]
+#>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param()
+
+    return @(
+        'dbo'
+        'guest'
+        'INFORMATION_SCHEMA'
+        'sys'
+        'db_owner'
+        'db_accessadmin'
+        'db_securityadmin'
+        'db_ddladmin'
+        'db_backupoperator'
+        'db_datareader'
+        'db_datawriter'
+        'db_denydatareader'
+        'db_denydatawriter'
+    )
+}
+
+function Format-SqlCpySchemaCreateStatement {
+<#
+.SYNOPSIS
+    Emits a safe, re-runnable "CREATE SCHEMA [name] AUTHORIZATION [dbo]"
+    batch for a given schema name.
+
+.DESCRIPTION
+    Produces the fallback statement used by the Schemas phase when SMO's
+    .Script() call fails (we have seen this on dwcontrol / SQL 2022 where
+    Schema.Script() throws "Script failed for Schema 'A00'" even though the
+    schema has a sane dbo owner and Schema.Script() works at an interactive
+    prompt). The statement is a guarded EXEC so it is safe to replay:
+
+        IF SCHEMA_ID(N'<escaped>') IS NULL
+            EXEC(N'CREATE SCHEMA [escaped] AUTHORIZATION [dbo]');
+
+    AUTHORIZATION [dbo] is intentional: the user has explicitly asked the
+    schema-only copy to ignore security, so we do NOT try to replay source
+    schema ownership. That keeps the target from depending on principals
+    that may not (and by design WILL not) have been copied.
+
+    Escaping rules:
+      * String-literal form: single quotes are doubled (T-SQL).
+      * Bracket-identifier form: right brackets (]) are doubled.
+      * All other characters (dollar signs, dots, spaces, unicode, leading
+        underscores) pass through unchanged because they are legal inside
+        [ ] quoted identifiers.
+
+.PARAMETER Name
+    Schema name exactly as it appears in sys.schemas.
+
+.OUTPUTS
+    [string] — a single T-SQL batch without a trailing GO (callers add GO).
+#>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)] [string]$Name
+    )
+
+    if ($null -eq $Name) { throw 'Schema name is required.' }
+    # Reject empty / whitespace-only names defensively.
+    if ([string]::IsNullOrWhiteSpace($Name)) {
+        throw "Invalid schema name '$Name' (empty or whitespace)."
+    }
+
+    $literal = $Name.Replace("'", "''")
+    $bracket = $Name.Replace(']', ']]')
+
+    # Inner single quotes (inside the EXEC(N'...')) must themselves survive
+    # one extra layer of doubling because the outer string is itself a
+    # single-quoted T-SQL literal.
+    $bracketInsideExec = $bracket.Replace("'", "''")
+
+    return ("IF SCHEMA_ID(N'{0}') IS NULL EXEC(N'CREATE SCHEMA [{1}] AUTHORIZATION [dbo]');" -f $literal, $bracketInsideExec)
+}
+
+function Get-SqlCpySchemaScriptLines {
+<#
+.SYNOPSIS
+    Returns T-SQL lines for a single schema object, with a safe fallback.
+
+.DESCRIPTION
+    The Schemas phase historically called `$schema.Script($options)` like
+    every other object. On a real source (SQL 2022 / dbatools 2.1.24 /
+    dwcontrol) that single-argument call throws
+        Exception calling "Script" with "1" argument(s):
+        "Script failed for Schema 'A00'."
+    for every schema, even schemas where the user can reproduce
+    `$schema.Script()` and `$schema.Script($options)` interactively.
+
+    The bug is not SQL metadata (owners, ACLs, compatibility level are
+    fine) — it is something in the generic scripter pipeline (options
+    combination, dependency discovery, or an internal SMO state leak on
+    the collection walk). The fix is narrow: try .Script($options), then
+    .Script() with no args, then fall back to a manual
+    "CREATE SCHEMA [name] AUTHORIZATION [dbo]" statement from the schema's
+    Name. Because the schema-only copy is explicitly security-free, using
+    AUTHORIZATION [dbo] is correct rather than a regression.
+
+.PARAMETER Schema
+    SMO Schema object (from $db.Schemas).
+
+.PARAMETER ScriptingOptions
+    Optional ScriptingOptions to try first.
+
+.PARAMETER WarningSink
+    Optional scriptblock that receives a warning string. The caller uses
+    this to route fallbacks through Write-SqlCpyWarning so operators see
+    why the manual path fired. Called as `& $WarningSink $msg`.
+
+.OUTPUTS
+    [string[]] — one or more T-SQL lines (no trailing GO).
+#>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param(
+        [Parameter(Mandatory)] $Schema,
+        $ScriptingOptions,
+        [scriptblock]$WarningSink
+    )
+
+    $name = $null
+    try { $name = [string]$Schema.Name } catch { $name = $null }
+    if ([string]::IsNullOrWhiteSpace($name)) {
+        throw 'Schema object has no readable Name property.'
+    }
+
+    $lastError = $null
+
+    if ($ScriptingOptions) {
+        try {
+            $lines = $Schema.Script($ScriptingOptions)
+            if ($lines) { return @($lines) }
+        } catch {
+            $lastError = $_.Exception
+        }
+    }
+
+    try {
+        $lines = $Schema.Script()
+        if ($lines) { return @($lines) }
+    } catch {
+        $lastError = $_.Exception
+    }
+
+    # Manual fallback. Log why we fell back so operators can investigate
+    # the SMO-side failure without losing the schema in the output.
+    if ($WarningSink) {
+        $inner = ''
+        if ($lastError) {
+            $inner = $lastError.Message
+            if ($lastError.InnerException) {
+                $inner += ' | inner: ' + $lastError.InnerException.Message
+            }
+        }
+        & $WarningSink ("    schema [{0}]: SMO .Script() failed, using manual CREATE SCHEMA fallback (AUTHORIZATION [dbo], security ignored by design). Detail: {1}" -f $name, $inner)
+    }
+
+    return ,(Format-SqlCpySchemaCreateStatement -Name $name)
+}
+
 function Get-SqlCpySchemaOnlyInlineOnlyTypes {
 <#
 .SYNOPSIS
@@ -514,7 +692,7 @@ function Export-SqlCpySchemaOnlyDatabase {
             if ($item.PSObject.Properties.Name -contains 'IsSystemObject' -and $item.IsSystemObject) { continue }
             if ($item.PSObject.Properties.Name -contains 'IsSystemNamed' -and $item.IsSystemNamed -and $phase.Property -eq 'Schemas') { continue }
             if ($phase.Property -eq 'Schemas') {
-                $sysSchemas = @('sys','INFORMATION_SCHEMA','guest','db_owner','db_accessadmin','db_securityadmin','db_ddladmin','db_backupoperator','db_datareader','db_datawriter','db_denydatareader','db_denydatawriter')
+                $sysSchemas = Get-SqlCpySchemaOnlySystemSchemaNames
                 if ($sysSchemas -contains $item.Name) { continue }
             }
             $phaseItems += ,$item
@@ -532,10 +710,22 @@ function Export-SqlCpySchemaOnlyDatabase {
         Set-Content -LiteralPath $phasePath -Value $phaseHeader -Encoding UTF8
         Add-Content -LiteralPath $phasePath -Value '' -Encoding UTF8
 
+        $warnSink = { param($msg) Write-SqlCpyWarning $msg }
+
         foreach ($item in $phaseItems) {
             try {
-                # SMO every object exposes .Script() returning a StringCollection.
-                $lines = $item.Script($scriptingOptions)
+                if ($phase.Property -eq 'Schemas') {
+                    # Schemas take the dedicated helper. SMO's generic
+                    # Script($options) path was observed to throw for every
+                    # schema on SQL 2022 / dbatools 2.1.24 even when owners
+                    # are plain [dbo]; the helper tries .Script($options),
+                    # then .Script(), then a manual CREATE SCHEMA ...
+                    # AUTHORIZATION [dbo] (security intentionally ignored).
+                    $lines = Get-SqlCpySchemaScriptLines -Schema $item -ScriptingOptions $scriptingOptions -WarningSink $warnSink
+                } else {
+                    # SMO every object exposes .Script() returning a StringCollection.
+                    $lines = $item.Script($scriptingOptions)
+                }
                 if ($null -eq $lines) { continue }
                 foreach ($l in $lines) {
                     Add-Content -LiteralPath $phasePath -Value $l -Encoding UTF8
@@ -545,8 +735,13 @@ function Export-SqlCpySchemaOnlyDatabase {
             } catch {
                 # Encrypted modules raise when .Script() tries to decrypt the body.
                 # Surface the object name and keep going - this is called out in
-                # DECISIONS_AND_CAVEATS.txt.
-                Write-SqlCpyWarning ("    skip {0} [{1}]: {2}" -f $item.Name, $phase.Property, $_.Exception.Message)
+                # DECISIONS_AND_CAVEATS.txt. Include inner exception when present
+                # so operators can see the real SMO error.
+                $detail = $_.Exception.Message
+                if ($_.Exception.InnerException) {
+                    $detail += ' | inner: ' + $_.Exception.InnerException.Message
+                }
+                Write-SqlCpyWarning ("    skip {0} [{1}]: {2}" -f $item.Name, $phase.Property, $detail)
             }
         }
 

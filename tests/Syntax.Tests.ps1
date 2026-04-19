@@ -678,6 +678,133 @@ if ($manifest) {
 }
 
 Write-Host ''
+Write-Host 'Probing schema-phase fallback helpers...' -ForegroundColor Cyan
+try {
+    # Format-SqlCpySchemaCreateStatement: escaping + always-dbo authorization.
+    $cases = @(
+        @{ In = 'A00';          Contains = "SCHEMA_ID(N'A00')";         Bracket = '[A00]'         }
+        @{ In = '_';            Contains = "SCHEMA_ID(N'_')";            Bracket = '[_]'           }
+        @{ In = 'ad';           Contains = "SCHEMA_ID(N'ad')";           Bracket = '[ad]'          }
+        @{ In = "O'Brien";      Contains = "SCHEMA_ID(N'O''Brien')";     Bracket = "[O''Brien]"    }
+        @{ In = 'weird]name';   Contains = "SCHEMA_ID(N'weird]name')";   Bracket = '[weird]]name]' }
+        @{ In = '$money';       Contains = "SCHEMA_ID(N'`$money')";     Bracket = '[$money]'      }
+        @{ In = 'a.b';          Contains = "SCHEMA_ID(N'a.b')";          Bracket = '[a.b]'         }
+    )
+    foreach ($c in $cases) {
+        $got = Format-SqlCpySchemaCreateStatement -Name $c.In
+        if ($got -notmatch 'AUTHORIZATION \[dbo\]') {
+            $failures += [pscustomobject]@{
+                File = $schemaFile
+                Errors = "Format-SqlCpySchemaCreateStatement('$($c.In)') did not emit AUTHORIZATION [dbo]: $got"
+            }
+        } elseif (-not $got.Contains($c.Contains)) {
+            $failures += [pscustomobject]@{
+                File = $schemaFile
+                Errors = "Format-SqlCpySchemaCreateStatement('$($c.In)') did not contain expected literal fragment '$($c.Contains)': $got"
+            }
+        } elseif (-not $got.Contains($c.Bracket)) {
+            $failures += [pscustomobject]@{
+                File = $schemaFile
+                Errors = "Format-SqlCpySchemaCreateStatement('$($c.In)') did not contain expected bracket fragment '$($c.Bracket)': $got"
+            }
+        } else {
+            Write-Host ("  OK  Format-SqlCpySchemaCreateStatement('{0}') -> {1}" -f $c.In, $got)
+        }
+    }
+
+    # Empty / whitespace-only schema names must be rejected.
+    $threw = $false
+    try { Format-SqlCpySchemaCreateStatement -Name '   ' | Out-Null } catch { $threw = $true }
+    if (-not $threw) {
+        $failures += [pscustomobject]@{
+            File = $schemaFile
+            Errors = 'Format-SqlCpySchemaCreateStatement must reject whitespace-only names.'
+        }
+    } else {
+        Write-Host '  OK  whitespace-only schema name rejected'
+    }
+
+    # Get-SqlCpySchemaScriptLines: .Script($opts) wins when it returns lines.
+    $mockA = [pscustomobject]@{ Name = 'Good' }
+    $mockA | Add-Member -MemberType ScriptMethod -Name Script -Force -Value {
+        param($opts)
+        if ($opts) { return @('CREATE SCHEMA [Good];') }
+        return @('fallback-should-not-be-used')
+    }
+    $out = Get-SqlCpySchemaScriptLines -Schema $mockA -ScriptingOptions ([pscustomobject]@{X=1})
+    if (($out -join "`n") -notmatch 'CREATE SCHEMA \[Good\]') {
+        $failures += [pscustomobject]@{
+            File = $schemaFile
+            Errors = "Get-SqlCpySchemaScriptLines should prefer .Script(`$opts) when it returns lines; got: $($out -join '|')"
+        }
+    } else {
+        Write-Host '  OK  helper prefers .Script($options)'
+    }
+
+    # When .Script($opts) throws, .Script() (no args) is tried.
+    $mockB = [pscustomobject]@{ Name = 'FallbackOK' }
+    $mockB | Add-Member -MemberType ScriptMethod -Name Script -Force -Value {
+        param($opts)
+        if ($opts) { throw 'simulated options failure' }
+        return @('CREATE SCHEMA [FallbackOK];')
+    }
+    $warnings = New-Object System.Collections.Generic.List[string]
+    $sink = { param($m) $warnings.Add($m) }
+    $out2 = Get-SqlCpySchemaScriptLines -Schema $mockB -ScriptingOptions ([pscustomobject]@{}) -WarningSink $sink
+    if (($out2 -join "`n") -notmatch 'CREATE SCHEMA \[FallbackOK\]') {
+        $failures += [pscustomobject]@{
+            File = $schemaFile
+            Errors = "Get-SqlCpySchemaScriptLines should fall back to .Script() no-arg when .Script(`$opts) throws; got: $($out2 -join '|')"
+        }
+    } else {
+        Write-Host '  OK  helper falls back to .Script() when .Script($opts) throws'
+    }
+
+    # When both overloads throw, emit the manual fallback and warn.
+    $mockC = [pscustomobject]@{ Name = 'A00' }
+    $mockC | Add-Member -MemberType ScriptMethod -Name Script -Force -Value {
+        param($opts)
+        throw ('Script failed for Schema ''{0}''.' -f $this.Name)
+    }
+    $warnings.Clear()
+    $out3 = Get-SqlCpySchemaScriptLines -Schema $mockC -ScriptingOptions ([pscustomobject]@{}) -WarningSink $sink
+    if (($out3 -join "`n") -notmatch 'CREATE SCHEMA \[A00\] AUTHORIZATION \[dbo\]') {
+        $failures += [pscustomobject]@{
+            File = $schemaFile
+            Errors = "Get-SqlCpySchemaScriptLines manual fallback must emit CREATE SCHEMA [A00] AUTHORIZATION [dbo]; got: $($out3 -join '|')"
+        }
+    } else {
+        Write-Host '  OK  helper falls back to manual CREATE SCHEMA with AUTHORIZATION [dbo]'
+    }
+    if ($warnings.Count -lt 1 -or ($warnings -join "`n") -notmatch 'manual CREATE SCHEMA fallback') {
+        $failures += [pscustomobject]@{
+            File = $schemaFile
+            Errors = "Get-SqlCpySchemaScriptLines must route a warning through WarningSink when using manual fallback."
+        }
+    } else {
+        Write-Host '  OK  helper routes warning through WarningSink on manual fallback'
+    }
+
+    # System schemas helper covers the four the user called out plus db_* roles.
+    $sys = Get-SqlCpySchemaOnlySystemSchemaNames
+    foreach ($s in 'dbo','guest','INFORMATION_SCHEMA','sys','db_owner') {
+        if ($sys -notcontains $s) {
+            $failures += [pscustomobject]@{
+                File = $schemaFile
+                Errors = "Get-SqlCpySchemaOnlySystemSchemaNames missing required system schema: $s"
+            }
+        } else {
+            Write-Host "  OK  system-schema list contains $s"
+        }
+    }
+} catch {
+    $failures += [pscustomobject]@{
+        File = $schemaFile
+        Errors = "Schema-phase fallback probe failed: $($_.Exception.Message)"
+    }
+}
+
+Write-Host ''
 if ($failures.Count -eq 0) {
     Write-Host 'All syntax and config checks passed.' -ForegroundColor Green
     exit 0

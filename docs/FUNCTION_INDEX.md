@@ -204,6 +204,28 @@ commands (`Copy-DbaDbTableData`, BCP, `INSERT`s) are not invoked.
   — Returns the object types (`ForeignKeys`, `Indexes`, `Triggers` on tables,
   `FullTextIndexes`) that are scripted inline with their parent and therefore
   have no dedicated phase.
+- **`Get-SqlCpySchemaOnlySystemSchemaNames`** (`src/SqlServerCpy/Public/SchemaOnlyDatabase.ps1`)
+  — Returns the schema names the Schemas phase must never emit (`dbo`,
+  `guest`, `INFORMATION_SCHEMA`, `sys`, and the `db_*` fixed-role schemas).
+  The Schemas phase filter uses this list.
+- **`Get-SqlCpySchemaScriptLines`** (`src/SqlServerCpy/Public/SchemaOnlyDatabase.ps1`)
+  — Per-schema scripting helper. Tries `$schema.Script($options)`, then
+  `$schema.Script()` with no args, then falls back to a manual
+  `CREATE SCHEMA [name] AUTHORIZATION [dbo]` statement built from the
+  schema name. Exists because SMO's generic `.Script($options)` path was
+  observed to fail on SQL 2022 / dbatools 2.1.24 (e.g. `dwcontrol`) with
+  `Script failed for Schema 'A00'.` even when the schema has a plain `dbo`
+  owner and interactive `.Script()` works. Takes a `-WarningSink`
+  scriptblock so the caller can route the fallback notice through
+  `Write-SqlCpyWarning` with the original SMO error detail.
+- **`Format-SqlCpySchemaCreateStatement`** (`src/SqlServerCpy/Public/SchemaOnlyDatabase.ps1`)
+  — Emits a guarded, re-runnable
+  `IF SCHEMA_ID(N'…') IS NULL EXEC(N'CREATE SCHEMA […] AUTHORIZATION [dbo]')`
+  batch. Escapes single quotes (for the T-SQL literal and the nested EXEC
+  literal) and right brackets (for the quoted identifier). Always uses
+  `AUTHORIZATION [dbo]` because the schema-only copy intentionally ignores
+  security; replaying the source owner would require principals that by
+  design are not being copied.
 
 ## Planned (not in this scaffold)
 

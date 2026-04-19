@@ -317,6 +317,19 @@ SchemaOnlyExcludeSecurity    = $true    # always true by design
 - **SQL version differences.** The scripting-option builder only sets
   properties that exist on the installed SMO variant. Missing properties
   are tolerated; missing SMO collections log as "skip" for that phase.
+- **Schema phase fallback.** On some sources (observed on SQL 2022 /
+  dbatools 2.1.24, e.g. `dwcontrol`) SMO's generic `Schema.Script($opts)`
+  throws `Script failed for Schema '<name>'.` for every schema — even
+  schemas whose `sys.schemas` owner is plain `dbo`. The Schemas phase
+  therefore tries `$schema.Script($opts)`, then `$schema.Script()` with
+  no args, and finally emits a manual, guarded
+  `IF SCHEMA_ID(N'<name>') IS NULL EXEC(N'CREATE SCHEMA [<name>]
+  AUTHORIZATION [dbo]');` statement. The `AUTHORIZATION [dbo]` choice is
+  intentional and aligned with the "ignore security" requirement: the
+  copy does not script the source's schema owner because the owning
+  principal is, by design, not being copied. When the manual fallback
+  fires, the original SMO error is logged as a `WARN` line so the
+  underlying SMO problem is still visible.
 
 ## Safety defaults
 

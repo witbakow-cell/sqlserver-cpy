@@ -57,6 +57,9 @@
         'Get-SqlCpySchemaOnlySecurityExcludedTypes'
         'Get-SqlCpySchemaOnlyScriptPhases'
         'Get-SqlCpySchemaOnlyInlineOnlyTypes'
+        'Get-SqlCpySchemaOnlySystemSchemaNames'
+        'Format-SqlCpySchemaCreateStatement'
+        'Get-SqlCpySchemaScriptLines'
     )
     CmdletsToExport   = @()
     VariablesToExport = @()
