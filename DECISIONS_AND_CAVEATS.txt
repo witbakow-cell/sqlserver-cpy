@@ -204,6 +204,78 @@ Observations
   checks for items that sp_configure does not expose (e.g. tempdb file
   layout, trace flags, collation).
 
+9. Schema-only database copy: full object model, no security, no data.
+   - Requirement: produce a target database that has the same shape as
+     the source but no row data and no security principals. That is the
+     point of the "Copy selected databases (schema-only, no data)" TUI
+     action.
+   - Coverage: the copy scripts schemas, tables (columns, PK/UK/CK,
+     defaults, computed columns), foreign keys, indexes (incl. filtered,
+     columnstore, XML), views, scalar/inline-TVF/multi-statement-TVF/CLR
+     functions, T-SQL + CLR stored procedures, DML triggers (inline with
+     tables) and DDL triggers (db-scope), sequences, synonyms, alias /
+     CLR / table-valued user-defined types, XML schema collections,
+     partition functions and schemes, full-text catalogs and indexes,
+     legacy default/rule objects, CLR assemblies, and Service Broker
+     queue definitions. The combined script begins with a
+     "CREATE DATABASE IF NOT EXISTS" guard so it can be replayed against
+     an empty target.
+   - Security categories EXCLUDED, per user instruction: users, database
+     roles, application roles, permissions, role memberships, database
+     audit specs, audits, credentials, asymmetric / symmetric keys,
+     certificates, master key, cryptographic providers, security
+     policies. The list lives in
+     Get-SqlCpySchemaOnlySecurityExcludedTypes and the scripting options
+     set Permissions = $false / IncludeDatabaseRoleMemberships = $false
+     / LoginSid = $false to force this at the SMO layer.
+   - Data categories EXCLUDED, per user instruction: the scripting
+     options set ScriptData = $false, and the copy never calls
+     Copy-DbaDbTableData, Write-DbaDataTable, or BCP. A syntax test
+     asserts the module contains no data-movement commands.
+   - Ordering: phases are emitted in a dependency-safe order (schemas
+     first, tables with DRI and indexes inline, FKs/FullText/DDL
+     triggers later). SMO WithDependencies is also on, so Scripter
+     pulls referenced objects inside a phase.
+   - Artifacts: per-phase .sql files are written under
+     <output>/<db>/NN_Phase.sql plus a combined <output>/<db>.sql. In
+     DryRun the artifacts are produced but not applied; the log calls
+     out both paths.
+   - Caveats specific to this action:
+       * Encrypted modules (WITH ENCRYPTION) cannot be scripted via
+         SMO .Script() - the body is unreadable. The scaffold logs a
+         WARN per affected object and continues. If the target needs
+         encrypted modules, decrypt on the source first or rebuild
+         from source control.
+       * Filegroups, physical .mdf/.ldf paths, and data-file layout
+         are NOT replayed - the combined script issues a simple
+         CREATE DATABASE with server defaults. Partition schemes emit
+         their filegroup names; those filegroups must exist on the
+         target or CREATE PARTITION SCHEME will fail. Create target
+         filegroups manually if the source is partitioned.
+       * Full-text catalogs/indexes require the Full-Text Search
+         feature on the target. The copy will script them regardless;
+         the apply step fails cleanly if the feature is missing.
+       * Service Broker queues script their definitions only.
+         Contracts, services, routes, and remote service bindings are
+         not in scope for this action.
+       * Cross-database references (three-part names, linked-server
+         references) are scripted verbatim - the referenced database
+         or linked server must exist on the target or the object
+         becomes invalid (SQL Server still creates it; runtime use
+         will fail).
+       * Permissions / role memberships / explicit GRANTs tied to
+         application roles are lost by design. Re-run the login copy
+         action first (option 3) and re-apply ownership/permission
+         post-steps manually if you need them.
+       * SMO property names drift slightly between SQL versions; the
+         options builder only sets properties that exist on the
+         returned object, so missing properties are tolerated. If a
+         category's collection is unavailable the phase is logged as
+         skipped.
+       * DryRun is the default and the artifacts are written anyway,
+         so the user can review exactly what would be applied before
+         flipping DryRun off.
+
 Caveats
 -------
 

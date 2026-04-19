@@ -485,6 +485,199 @@ try {
 }
 
 Write-Host ''
+Write-Host 'Dot-sourcing SchemaOnlyDatabase.ps1 and probing scripting defaults...' -ForegroundColor Cyan
+$schemaFile = Join-Path -Path $repoRoot -ChildPath 'src/SqlServerCpy/Public/SchemaOnlyDatabase.ps1'
+try {
+    . $schemaFile
+
+    $defaults = Get-SqlCpySchemaOnlyObjectTypeDefaults
+    $mustInclude = @(
+        'Schemas','Tables','ForeignKeys','Indexes','Views','StoredProcedures',
+        'UserDefinedFunctions','Triggers','Sequences','Synonyms',
+        'UserDefinedDataTypes','UserDefinedTableTypes','XmlSchemaCollections',
+        'PartitionFunctions','PartitionSchemes','FullTextCatalogs','FullTextIndexes',
+        'DatabaseTriggers','Defaults'
+    )
+    foreach ($t in $mustInclude) {
+        if ($defaults -notcontains $t) {
+            $failures += [pscustomobject]@{
+                File = $schemaFile
+                Errors = "SchemaOnly default object types missing: $t"
+            }
+        } else {
+            Write-Host "  OK  schema-only default includes $t"
+        }
+    }
+
+    $excluded = Get-SqlCpySchemaOnlySecurityExcludedTypes
+    $mustExclude = @('Users','Roles','Permissions','RoleMembership','DatabaseRoles')
+    foreach ($t in $mustExclude) {
+        if ($excluded -notcontains $t) {
+            $failures += [pscustomobject]@{
+                File = $schemaFile
+                Errors = "SchemaOnly security-excluded list missing: $t"
+            }
+        } else {
+            Write-Host "  OK  schema-only excludes security type $t"
+        }
+    }
+
+    # Defaults list must NOT leak any security category.
+    foreach ($sec in $excluded) {
+        if ($defaults -contains $sec) {
+            $failures += [pscustomobject]@{
+                File = $schemaFile
+                Errors = "Security category '$sec' leaked into SchemaOnly default includes."
+            }
+        }
+    }
+
+    $phases = Get-SqlCpySchemaOnlyScriptPhases
+    if ($phases.Count -lt 10) {
+        $failures += [pscustomobject]@{
+            File = $schemaFile
+            Errors = "Expected >= 10 schema-only phases, got $($phases.Count)"
+        }
+    } else {
+        Write-Host "  OK  schema-only phase count = $($phases.Count)"
+    }
+
+    # Phases ordering: Schemas must come before Tables, Tables before Views,
+    # Views before StoredProcedures. Foreign keys scripted via DriForeignKeys
+    # inline with tables, so we only assert the critical relative order.
+    $phaseIndex = @{}
+    for ($i = 0; $i -lt $phases.Count; $i++) { $phaseIndex[$phases[$i].Property] = $i }
+    $ordering = @(
+        @('Schemas','Tables'),
+        @('Tables','Views'),
+        @('Views','StoredProcedures'),
+        @('UserDefinedDataTypes','Tables'),
+        @('PartitionFunctions','PartitionSchemes'),
+        @('FullTextCatalogs','Views')
+    )
+    foreach ($pair in $ordering) {
+        if ($phaseIndex.ContainsKey($pair[0]) -and $phaseIndex.ContainsKey($pair[1])) {
+            if ($phaseIndex[$pair[0]] -ge $phaseIndex[$pair[1]]) {
+                $failures += [pscustomobject]@{
+                    File = $schemaFile
+                    Errors = "SchemaOnly phase order wrong: $($pair[0]) should come before $($pair[1])"
+                }
+            } else {
+                Write-Host "  OK  phase order: $($pair[0]) -> $($pair[1])"
+            }
+        }
+    }
+
+    $inline = Get-SqlCpySchemaOnlyInlineOnlyTypes
+    foreach ($t in 'ForeignKeys','Indexes','Triggers','FullTextIndexes') {
+        if ($inline -notcontains $t) {
+            $failures += [pscustomobject]@{
+                File = $schemaFile
+                Errors = "Inline-only list missing: $t"
+            }
+        } else {
+            Write-Host "  OK  inline-only contains $t"
+        }
+    }
+
+    # New-SqlCpySchemaOnlyScriptingOption must return an object whose flags
+    # exclude data + security and include indexes/triggers/DRI when those
+    # property names exist on the returned object. We set them on a bare
+    # pscustomobject fallback so the check works without SMO installed.
+    $probeOpts = New-SqlCpySchemaOnlyScriptingOption
+    if (-not $probeOpts) {
+        $failures += [pscustomobject]@{
+            File = $schemaFile
+            Errors = "New-SqlCpySchemaOnlyScriptingOption returned `$null"
+        }
+    } else {
+        Write-Host "  OK  scripting option object is non-null (type=$($probeOpts.GetType().Name))"
+    }
+
+    # Verify the scripting-option builder explicitly sets the critical flags.
+    $schemaText = Get-Content -LiteralPath $schemaFile -Raw
+    $mustContain = @(
+        'ScriptData\s*=\s*\$false'
+        'ScriptSchema\s*=\s*\$true'
+        'Indexes\s*=\s*\$true'
+        'Triggers\s*=\s*\$true'
+        'DriForeignKeys\s*=\s*\$true'
+        'DriPrimaryKey\s*=\s*\$true'
+        'DriChecks\s*=\s*\$true'
+        'DriDefaults\s*=\s*\$true'
+        'FullTextIndexes\s*=\s*\$true'
+        'Permissions\s*=\s*\$false'
+        'IncludeDatabaseRoleMemberships\s*=\s*\$false'
+        'LoginSid\s*=\s*\$false'
+    )
+    foreach ($pat in $mustContain) {
+        if ($schemaText -notmatch $pat) {
+            $failures += [pscustomobject]@{
+                File = $schemaFile
+                Errors = "SchemaOnly scripting options missing flag matching: $pat"
+            }
+        } else {
+            Write-Host "  OK  scripting options set: $pat"
+        }
+    }
+
+    # Body must not issue BCP or INSERT data operations.
+    if ($schemaText -match 'Copy-DbaDbTableData|Write-DbaDataTable|bcp\.exe|INSERT\s+INTO') {
+        $failures += [pscustomobject]@{
+            File = $schemaFile
+            Errors = "SchemaOnly copy must not invoke any data-movement path."
+        }
+    } else {
+        Write-Host "  OK  no data-movement commands present"
+    }
+} catch {
+    $failures += [pscustomobject]@{
+        File = $schemaFile
+        Errors = $_.Exception.Message
+    }
+}
+
+Write-Host ''
+Write-Host 'Checking config/default.psd1 SchemaOnly keys and manifest exports...' -ForegroundColor Cyan
+try {
+    $cfg2 = Import-PowerShellDataFile -Path $cfgPath
+    foreach ($k in 'SchemaOnlyIncludeObjectTypes','SchemaOnlyExcludeSecurity','SchemaOnlyDatabaseList') {
+        if (-not $cfg2.ContainsKey($k)) {
+            $failures += [pscustomobject]@{
+                File = $cfgPath
+                Errors = "Missing SchemaOnly config key: $k"
+            }
+        } else {
+            Write-Host "  OK  config has $k"
+        }
+    }
+    if ($cfg2.SchemaOnlyExcludeSecurity -ne $true) {
+        $failures += [pscustomobject]@{
+            File = $cfgPath
+            Errors = "SchemaOnlyExcludeSecurity must default to `$true"
+        }
+    }
+} catch {
+    $failures += [pscustomobject]@{
+        File = $cfgPath
+        Errors = $_.Exception.Message
+    }
+}
+
+if ($manifest) {
+    foreach ($fn in 'Export-SqlCpySchemaOnlyDatabase','New-SqlCpySchemaOnlyScriptingOption','Get-SqlCpySchemaOnlyObjectTypeDefaults','Get-SqlCpySchemaOnlySecurityExcludedTypes','Get-SqlCpySchemaOnlyScriptPhases','Get-SqlCpySchemaOnlyInlineOnlyTypes') {
+        if ($manifest.FunctionsToExport -notcontains $fn) {
+            $failures += [pscustomobject]@{
+                File = $manifestPath
+                Errors = "FunctionsToExport missing SchemaOnly helper: $fn"
+            }
+        } else {
+            Write-Host "  OK  manifest exports $fn"
+        }
+    }
+}
+
+Write-Host ''
 if ($failures.Count -eq 0) {
     Write-Host 'All syntax and config checks passed.' -ForegroundColor Green
     exit 0

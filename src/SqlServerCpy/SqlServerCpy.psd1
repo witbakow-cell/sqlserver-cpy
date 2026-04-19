@@ -51,6 +51,12 @@
         'Copy-SqlCpySsrsSchedules'
         'Copy-SqlCpySsrsSubscriptions'
         'Invoke-SqlCpySchemaOnlyDatabaseCopy'
+        'Export-SqlCpySchemaOnlyDatabase'
+        'New-SqlCpySchemaOnlyScriptingOption'
+        'Get-SqlCpySchemaOnlyObjectTypeDefaults'
+        'Get-SqlCpySchemaOnlySecurityExcludedTypes'
+        'Get-SqlCpySchemaOnlyScriptPhases'
+        'Get-SqlCpySchemaOnlyInlineOnlyTypes'
     )
     CmdletsToExport   = @()
     VariablesToExport = @()

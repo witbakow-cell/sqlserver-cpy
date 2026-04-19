@@ -56,6 +56,18 @@
     # Databases to copy as schema-only (no data). Empty array = none selected by default.
     SchemaOnlyDatabaseList = @()
 
+    # Schema-only copy: object categories to include. $null / empty = use the
+    # defaults from Get-SqlCpySchemaOnlyObjectTypeDefaults (full object model
+    # excluding data and security). Override in local.psd1 only to narrow the
+    # scope - the defaults are designed to produce a faithful empty clone.
+    SchemaOnlyIncludeObjectTypes = $null
+
+    # Schema-only copy: security objects are ALWAYS excluded regardless of
+    # this flag, per the user's explicit "ignore security" requirement. The
+    # flag is kept for documentation visibility; setting it to $false does NOT
+    # re-enable scripting of users/roles/permissions.
+    SchemaOnlyExcludeSecurity = $true
+
     # SSIS catalog scope. $null = all folders.
     SsisFolders = $null
 

@@ -253,6 +253,71 @@ Known caveats (also in `DECISIONS_AND_CAVEATS.txt`):
 Running the SSRS copy requires a PowerShell host with `New-WebServiceProxy`
 (Windows PowerShell 5.1, or PowerShell 7.x on Windows).
 
+## Schema-only database copy
+
+Option **7) Copy selected databases (schema-only, no data)** produces a
+target database with the **same object model** as the source but with **no
+row data and no security principals**. The action scripts:
+
+- Schemas
+- Tables (columns, PK / UK / CHECK constraints, defaults, computed columns)
+- Foreign keys (scripted inline with tables via `DriForeignKeys`)
+- Indexes — non-clustered, clustered, filtered, columnstore, XML (inline)
+- Views, functions (scalar / inline-TVF / multi-statement-TVF / CLR),
+  stored procedures (T-SQL + CLR)
+- DML triggers (inline with tables) and DDL triggers (database scope)
+- Sequences, synonyms
+- User-defined types — alias, CLR, and table-valued (TVP) types
+- XML schema collections
+- Partition functions and partition schemes
+- Full-text catalogs and full-text indexes
+- Legacy default / rule objects, CLR assemblies, Service Broker queue
+  definitions
+
+Security objects are **always excluded**: users, database/application roles,
+permissions, role memberships, audits, credentials, certificates, keys, and
+security policies. Data is **always excluded**: no `INSERT`s, no
+`Copy-DbaDbTableData`, no `bcp`. These are non-negotiable per the user's
+explicit "ignore security, ignore data" requirement.
+
+Artifacts: per-phase `.sql` files are written under
+`<output>/<db>/NN_Phase.sql`, plus a combined `<output>/<db>.sql` that begins
+with a `CREATE DATABASE IF NOT EXISTS` guard so it can be replayed against
+an empty target. In **DryRun** the artifacts are produced but not applied.
+
+Config knobs in `config/default.psd1`:
+
+```powershell
+SchemaOnlyDatabaseList       = @()      # which databases to copy
+SchemaOnlyIncludeObjectTypes = $null    # $null = use the full defaults
+SchemaOnlyExcludeSecurity    = $true    # always true by design
+```
+
+### Caveats
+
+- **Encrypted modules.** `WITH ENCRYPTION` makes the body unreadable to
+  SMO. The scaffold logs a WARN per affected object and continues; rebuild
+  those modules from source control on the target.
+- **Filegroups and partitioning.** The combined script does `CREATE
+  DATABASE <name>` with server defaults. If the source uses custom
+  filegroups or partition schemes, create those filegroups on the target
+  before applying the script, or edit the `08_PartitionFunctions.sql` /
+  `09_PartitionSchemes.sql` phase files.
+- **Full-Text Search.** Full-text catalogs / indexes require the Full-Text
+  Search feature to be installed on the target. The apply step fails
+  cleanly if the feature is missing.
+- **Service Broker.** Queue definitions are scripted; contracts, services,
+  routes, and remote service bindings are not.
+- **Cross-database references.** Three-part-name and linked-server
+  references are scripted verbatim — the referenced database or linked
+  server must exist on the target for the objects to be valid at runtime.
+- **Security / permissions.** Lost by design. Run option 3 (Copy logins)
+  first if you need logins; re-apply ownership and explicit GRANTs
+  manually.
+- **SQL version differences.** The scripting-option builder only sets
+  properties that exist on the installed SMO variant. Missing properties
+  are tolerated; missing SMO collections log as "skip" for that phase.
+
 ## Safety defaults
 
 The configuration file includes a `DryRun` flag (default `$true`). Destructive operations

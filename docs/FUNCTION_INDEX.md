@@ -155,9 +155,55 @@ phase failures are logged and do not abort the rest.
 
 ## Schema-only database copy
 
+The schema-only action produces a target database with the **same object
+model** as the source but **no data and no security**. It scripts schemas,
+tables (columns, PK/UK/CK, defaults, computed columns), foreign keys, indexes
+(incl. filtered, columnstore, XML), views, functions, stored procedures, DML
+and DDL triggers, sequences, synonyms, alias/CLR/table-valued user-defined
+types, XML schema collections, partition functions/schemes, full-text
+catalogs and indexes, legacy defaults/rules, CLR assemblies, and Service
+Broker queue definitions. Users, roles, permissions, role memberships, keys,
+certificates, and audit specifications are **never** scripted. Data-movement
+commands (`Copy-DbaDbTableData`, BCP, `INSERT`s) are not invoked.
+
 - **`Invoke-SqlCpySchemaOnlyDatabaseCopy`** (`src/SqlServerCpy/Public/SchemaOnlyDatabase.ps1`)
-  — Scripts objects from source databases and applies them to the target without data.
-  Honours DryRun.
+  — Top-level entry point. Walks each source database via SMO (reached through
+  the cached `Connect-DbaInstance` handle, so TLS/trust settings apply), writes
+  per-phase `.sql` files plus a combined script to an artifacts folder, and
+  (unless `DryRun`) applies the combined script to the target. Creates the
+  target database with `CREATE DATABASE IF NOT EXISTS` at the top of the
+  combined script. Honours `DryRun` (default `$true`). Accepts
+  `-IncludeObjectTypes` for narrow runs; defaults come from
+  `Get-SqlCpySchemaOnlyObjectTypeDefaults`.
+- **`Export-SqlCpySchemaOnlyDatabase`** (`src/SqlServerCpy/Public/SchemaOnlyDatabase.ps1`)
+  — Pure scripting pass. Given an open connection and a database name, emits
+  a per-phase `.sql` file for every enabled object category plus a combined
+  `<db>.sql`. Separated from the orchestrator so tests and callers can stub
+  the database object.
+- **`New-SqlCpySchemaOnlyScriptingOption`** (`src/SqlServerCpy/Public/SchemaOnlyDatabase.ps1`)
+  — Builds an SMO `ScriptingOptions` (or dbatools `New-DbaScriptingOption`
+  wrapper) configured for schema + DRI + indexes + DML/FullText triggers, with
+  **`ScriptData = $false`**, **`Permissions = $false`**,
+  **`IncludeDatabaseRoleMemberships = $false`**, and **`LoginSid = $false`**.
+  Only sets properties that exist on the current SMO variant, so it tolerates
+  minor SQL version differences.
+- **`Get-SqlCpySchemaOnlyObjectTypeDefaults`** (`src/SqlServerCpy/Public/SchemaOnlyDatabase.ps1`)
+  — Returns the canonical list of SMO object categories that the schema-only
+  copy includes by default.
+- **`Get-SqlCpySchemaOnlySecurityExcludedTypes`** (`src/SqlServerCpy/Public/SchemaOnlyDatabase.ps1`)
+  — Returns the categories that the schema-only copy must **never** script
+  (users/roles/permissions/certificates/etc.). Used by the Defaults list and
+  by tests to prove no security category leaks into the include list.
+- **`Get-SqlCpySchemaOnlyScriptPhases`** (`src/SqlServerCpy/Public/SchemaOnlyDatabase.ps1`)
+  — Returns the ordered `Phase / SmoProperty / Description` tuples that
+  control the per-phase scripting walk. Order is dependency-safe: schemas ->
+  types/sequences/partitions -> synonyms -> tables (inline PK/UK/CK/FK/indexes/
+  DML triggers) -> full-text catalogs -> views -> functions -> procedures ->
+  broker queues -> DDL triggers.
+- **`Get-SqlCpySchemaOnlyInlineOnlyTypes`** (`src/SqlServerCpy/Public/SchemaOnlyDatabase.ps1`)
+  — Returns the object types (`ForeignKeys`, `Indexes`, `Triggers` on tables,
+  `FullTextIndexes`) that are scripted inline with their parent and therefore
+  have no dedicated phase.
 
 ## Planned (not in this scaffold)
 
