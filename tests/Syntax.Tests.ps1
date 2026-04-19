@@ -630,6 +630,26 @@ try {
     } else {
         Write-Host "  OK  no data-movement commands present"
     }
+
+    # Full-text catalog phase must be muted by default: orchestrator honours
+    # SchemaOnlyIncludeFullTextCatalogs and filters 'FullTextCatalogs' out of
+    # the include list when the flag is $false.
+    if ($schemaText -notmatch 'SchemaOnlyIncludeFullTextCatalogs') {
+        $failures += [pscustomobject]@{
+            File = $schemaFile
+            Errors = "SchemaOnly copy must honour SchemaOnlyIncludeFullTextCatalogs to mute 14_FullTextCatalogs by default."
+        }
+    } else {
+        Write-Host "  OK  SchemaOnlyIncludeFullTextCatalogs honoured by orchestrator"
+    }
+    if ($schemaText -notmatch "-ne\s+'FullTextCatalogs'") {
+        $failures += [pscustomobject]@{
+            File = $schemaFile
+            Errors = "SchemaOnly copy must filter 'FullTextCatalogs' out of IncludeObjectTypes when muted."
+        }
+    } else {
+        Write-Host "  OK  FullTextCatalogs filtered from IncludeObjectTypes when muted"
+    }
 } catch {
     $failures += [pscustomobject]@{
         File = $schemaFile
@@ -641,7 +661,7 @@ Write-Host ''
 Write-Host 'Checking config/default.psd1 SchemaOnly keys and manifest exports...' -ForegroundColor Cyan
 try {
     $cfg2 = Import-PowerShellDataFile -Path $cfgPath
-    foreach ($k in 'SchemaOnlyIncludeObjectTypes','SchemaOnlyExcludeSecurity','SchemaOnlyDatabaseList') {
+    foreach ($k in 'SchemaOnlyIncludeObjectTypes','SchemaOnlyExcludeSecurity','SchemaOnlyDatabaseList','SchemaOnlyIncludeFullTextCatalogs') {
         if (-not $cfg2.ContainsKey($k)) {
             $failures += [pscustomobject]@{
                 File = $cfgPath
@@ -656,6 +676,15 @@ try {
             File = $cfgPath
             Errors = "SchemaOnlyExcludeSecurity must default to `$true"
         }
+    }
+    # Full-text catalog phase must be muted by default, per user request.
+    if ($cfg2.SchemaOnlyIncludeFullTextCatalogs -ne $false) {
+        $failures += [pscustomobject]@{
+            File = $cfgPath
+            Errors = "SchemaOnlyIncludeFullTextCatalogs must default to `$false so 14_FullTextCatalogs is muted"
+        }
+    } else {
+        Write-Host "  OK  SchemaOnlyIncludeFullTextCatalogs defaults to `$false (14_FullTextCatalogs muted)"
     }
 } catch {
     $failures += [pscustomobject]@{

@@ -270,7 +270,9 @@ row data and no security principals**. The action scripts:
 - User-defined types — alias, CLR, and table-valued (TVP) types
 - XML schema collections
 - Partition functions and partition schemes
-- Full-text catalogs and full-text indexes
+- Full-text indexes (scripted inline with their parent tables). The
+  standalone full-text **catalogs** phase is muted by default; opt in via
+  `SchemaOnlyIncludeFullTextCatalogs = $true`.
 - Legacy default / rule objects, CLR assemblies, Service Broker queue
   definitions
 
@@ -291,6 +293,7 @@ Config knobs in `config/default.psd1`:
 SchemaOnlyDatabaseList              = @()           # which databases to copy
 SchemaOnlyIncludeObjectTypes        = $null         # $null = use the full defaults
 SchemaOnlyExcludeSecurity           = $true         # always true by design
+SchemaOnlyIncludeFullTextCatalogs   = $false        # mute the 14_FullTextCatalogs phase (default off)
 SchemaOnlyTableScriptMode           = 'InProcess'   # 'InProcess' (default) | 'Isolated' | 'Collection'
 SchemaOnlyExcludeTables             = @()           # tables to skip in the Tables phase
 SchemaOnlyTableScriptTimeoutSeconds = 300           # per-table timeout — ONLY applies to 'Isolated' mode

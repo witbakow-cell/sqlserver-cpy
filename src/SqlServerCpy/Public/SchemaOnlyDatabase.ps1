@@ -824,6 +824,21 @@ function Invoke-SqlCpySchemaOnlyDatabaseCopy {
             $IncludeObjectTypes = Get-SqlCpySchemaOnlyObjectTypeDefaults
         }
     }
+
+    # Full-text catalog phase is muted by default. The per-catalog metadata
+    # walk is noisy and rarely useful for schema-only scaffolding, so users
+    # have to opt in by setting SchemaOnlyIncludeFullTextCatalogs = $true.
+    # Full-text INDEXES are still scripted inline with their parent tables
+    # via the FullTextIndexes scripting option - this toggle only controls
+    # the standalone 14_FullTextCatalogs phase.
+    $includeFtc = $false
+    if ($Config.ContainsKey('SchemaOnlyIncludeFullTextCatalogs')) {
+        $includeFtc = [bool]$Config.SchemaOnlyIncludeFullTextCatalogs
+    }
+    if (-not $includeFtc) {
+        $IncludeObjectTypes = @($IncludeObjectTypes | Where-Object { $_ -ne 'FullTextCatalogs' })
+    }
+
     Write-SqlCpyInfo ("Object categories: {0}" -f ($IncludeObjectTypes -join ', '))
     Write-SqlCpyInfo ("Security categories are excluded: {0}" -f ((Get-SqlCpySchemaOnlySecurityExcludedTypes) -join ', '))
 
@@ -1028,7 +1043,14 @@ function Export-SqlCpySchemaOnlyDatabase {
 
     foreach ($phase in $phases) {
         if ($IncludeObjectTypes -notcontains $phase.Property) {
-            Write-SqlCpyInfo ("  [skip] {0}: not in IncludeObjectTypes" -f $phase.Phase)
+            # Full-text catalogs are muted by default (see
+            # SchemaOnlyIncludeFullTextCatalogs). Skip silently so normal runs
+            # don't carry a "[skip] 14_FullTextCatalogs" line that users have
+            # asked us to suppress. Other muted phases still log a skip so
+            # operators can see why they were omitted.
+            if ($phase.Property -ne 'FullTextCatalogs') {
+                Write-SqlCpyInfo ("  [skip] {0}: not in IncludeObjectTypes" -f $phase.Phase)
+            }
             continue
         }
 

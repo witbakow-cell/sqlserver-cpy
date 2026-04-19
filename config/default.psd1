@@ -68,6 +68,16 @@
     # re-enable scripting of users/roles/permissions.
     SchemaOnlyExcludeSecurity = $true
 
+    # Schema-only copy: mute the standalone 14_FullTextCatalogs phase.
+    # Default $false = the phase is skipped silently and no '14_FullTextCatalogs'
+    # step appears in the normal run log. Full-text INDEXES are still scripted
+    # inline with their parent tables via the FullTextIndexes scripting option,
+    # so this flag only affects the per-catalog definition pass.
+    # Set to $true to re-enable the phase (e.g. when the target needs standalone
+    # CREATE FULLTEXT CATALOG statements and the Full-Text Search feature is
+    # installed). See DECISIONS_AND_CAVEATS.txt for the rationale.
+    SchemaOnlyIncludeFullTextCatalogs = $false
+
     # Schema-only copy: how the Tables phase emits scripts.
     #   'InProcess'  - (default) iterate tables one at a time in the main
     #                  runspace, reusing the already-connected SMO database.

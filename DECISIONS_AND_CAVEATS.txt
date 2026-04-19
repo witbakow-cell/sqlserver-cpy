@@ -253,8 +253,17 @@ Observations
          target or CREATE PARTITION SCHEME will fail. Create target
          filegroups manually if the source is partitioned.
        * Full-text catalogs/indexes require the Full-Text Search
-         feature on the target. The copy will script them regardless;
-         the apply step fails cleanly if the feature is missing.
+         feature on the target. Full-text INDEXES are scripted inline
+         with their parent tables via the FullTextIndexes scripting
+         option and are unaffected by the catalog toggle. The standalone
+         14_FullTextCatalogs phase is MUTED by default
+         (SchemaOnlyIncludeFullTextCatalogs = $false): no '[skip]
+         14_FullTextCatalogs' noise appears in normal runs, and no
+         per-catalog definitions are scripted. Opt in by setting
+         SchemaOnlyIncludeFullTextCatalogs = $true when the target
+         needs standalone CREATE FULLTEXT CATALOG statements and the
+         Full-Text Search feature is installed; the apply step still
+         fails cleanly if the feature is missing.
        * Service Broker queues script their definitions only.
          Contracts, services, routes, and remote service bindings are
          not in scope for this action.

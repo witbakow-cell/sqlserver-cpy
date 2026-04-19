@@ -188,6 +188,12 @@ commands (`Copy-DbaDbTableData`, BCP, `INSERT`s) are not invoked.
   `<db>.sql`. Separated from the orchestrator so tests and callers can stub
   the database object. Also writes `<output>/<db>/_skipped_tables.txt`
   recording any table excluded, timed out, or errored in the Tables phase.
+  The standalone `14_FullTextCatalogs` phase is muted by default — the
+  orchestrator removes `FullTextCatalogs` from the include list unless
+  `SchemaOnlyIncludeFullTextCatalogs = $true`, and when muted the phase is
+  skipped silently (no `[skip]` log line). Full-text **indexes** are still
+  scripted inline with their parent tables via the `FullTextIndexes`
+  scripting option.
 - **`New-SqlCpySchemaOnlyScriptingOption`** (`src/SqlServerCpy/Public/SchemaOnlyDatabase.ps1`)
   — Builds an SMO `ScriptingOptions` (or dbatools `New-DbaScriptingOption`
   wrapper) configured for schema + DRI + indexes + DML/FullText triggers, with
