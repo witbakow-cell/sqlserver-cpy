@@ -49,6 +49,7 @@
         Logins              = $true
         AgentJobs           = $true
         SsisCatalog         = $true
+        SsrsCatalog         = $true
         SchemaOnlyDatabases = $true
     }
 
@@ -57,6 +58,58 @@
 
     # SSIS catalog scope. $null = all folders.
     SsisFolders = $null
+
+    # Login copy: skip logins whose names start with any of these prefixes (case-
+    # insensitive). Matching is performed on the login name with any leading server
+    # or domain qualifier ("<domain>\") stripped, so "MYDOMAIN\BUILTIN\Administrators"
+    # and "BUILTIN\Administrators" both match the "BUILTIN" prefix.
+    #
+    # Rationale:
+    #   - NT AUTHORITY\* and NT SERVICE\* are machine-local principals on the target.
+    #   - BUILTIN\* is a Windows local-group prefix that is reissued by the target OS.
+    #   - ADIS is a site-local service-account prefix the user does not want migrated.
+    # Copying any of these tends to either fail outright or produce a login that does
+    # not resolve on the destination. Skip them and log clearly.
+    LoginSkipPrefixes = @(
+        'NT AUTHORITY'
+        'NT SERVICE'
+        'BUILTIN'
+        'ADIS'
+    )
+
+    # SSRS (SQL Server Reporting Services) copy settings.
+    #
+    # Architecture: the SSRS copy action talks to the ReportServer web service
+    # (ReportService2010 SOAP endpoint) on both source and target. It does NOT
+    # copy the ReportServer / ReportServerTempDB catalog databases directly.
+    # Doing that over SOAP keeps the copy portable across SSRS versions and
+    # avoids dragging along encrypted columns keyed to the source machine.
+    #
+    # Defaults match the typical scaffold layout: source is the existing report
+    # server on 'chbbbid2', target is a local SSRS instance on the migration
+    # workstation. Override via config/local.psd1 or the TUI.
+    SourceSsrsUri = 'http://chbbbid2/ReportServer'
+    TargetSsrsUri = 'http://localhost/ReportServer'
+
+    # Optional: path scope for the copy. $null = copy everything under '/'.
+    # Example: '/Finance' copies only the Finance folder subtree.
+    SsrsRootPath = '/'
+
+    # Fine-grained toggles. The explicit user requirement is NOT to skip any
+    # class of SSRS asset by default, so all of these default to $true. Flip
+    # individual flags only if a given asset type is known to be unsupported
+    # in your target environment (e.g. subscriptions on a fresh install with
+    # no SMTP configured).
+    CopySsrsFolders       = $true
+    CopySsrsReports       = $true
+    CopySsrsDatasets      = $true
+    CopySsrsDataSources   = $true
+    CopySsrsResources     = $true
+    CopySsrsSecurity      = $true   # item-level policies
+    CopySsrsRoles         = $true   # system + catalog role definitions
+    CopySsrsSubscriptions = $true   # best-effort; may fail on data-driven subs
+    CopySsrsSchedules     = $true
+    CopySsrsKpis          = $true   # mobile reports / KPIs where REST is available
 
     # Extra server configuration items to check that sp_configure does not expose.
     # Each entry is a free-form label; the implementation maps labels to checks.

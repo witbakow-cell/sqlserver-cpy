@@ -41,6 +41,45 @@ Decisions
 6. SSAS is a documented planned extension only.
    - Not implemented in this scaffold. See docs/SSAS_PLANNED.md.
 
+6b. SSRS copy uses the ReportService2010 SOAP API (+ REST where available)
+    rather than copying the ReportServer catalog database.
+    - Rationale: the ReportServer database carries encrypted columns
+      (stored data-source credentials, subscription delivery credentials)
+      that are bound to the source machine's symmetric key. A
+      database-level copy would either drop those columns or require
+      moving the SSRS encryption key out of band. The SOAP path gives
+      us a version-neutral, machine-portable migration at the cost of
+      having to re-enter secrets on the target.
+    - Scope: the orchestrator attempts to copy EVERY class of SSRS asset
+      the user can see in the portal - folders, shared data sources,
+      shared datasets, reports (including linked reports), resources,
+      item-level policies, role definitions (system + catalog), shared
+      schedules, subscriptions, and KPIs / mobile reports via REST.
+      This is a direct response to the "do not intentionally skip any
+      kind of SSRS asset" requirement.
+    - Failures are NOT fatal across phases: a missing principal that
+      blocks SetPolicies on one item still lets the rest of the copy
+      complete. Each failure is logged with an actionable hint.
+    - Default endpoints:
+        SourceSsrsUri = "http://chbbbid2/ReportServer"
+        TargetSsrsUri = "http://localhost/ReportServer"
+      Overridable in config/local.psd1 and via the TUI flow.
+    - Per-asset toggles (CopySsrsFolders, CopySsrsReports, ...) default
+      to $true; flip individual flags to $false only when an asset type
+      is known to be unsupported in the target environment.
+
+6c. Login copy: skip-prefix filter.
+    - config/default.psd1 declares LoginSkipPrefixes =
+        ('NT AUTHORITY', 'NT SERVICE', 'BUILTIN', 'ADIS').
+    - Match is case-insensitive and strips a single leading "<domain>\"
+      qualifier, so 'MYDOMAIN\BUILTIN\Administrators' matches 'BUILTIN'.
+    - Rationale: NT AUTHORITY / NT SERVICE / BUILTIN are machine-local
+      principals reissued by the target OS; copying them tends to
+      produce an unresolvable login. ADIS is a site-local service
+      account prefix the user does not want migrated.
+    - Every skipped login is logged individually (SKIP line) so the
+      effect is auditable.
+
 7. Connection security is centralized, not per-call, and applied via
    Connect-DbaInstance connection objects (not per-cmdlet flags).
    - Three config keys drive every dbatools call:

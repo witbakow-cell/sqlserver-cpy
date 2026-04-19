@@ -38,6 +38,43 @@ They are not checked into this repository. Obtain them from an official Microsof
 SSAS-related assemblies (AMO, TOM, ADOMD) are listed here because the project scope
 includes a planned SSAS extension. They are **not used** by the current scaffold code.
 
+## SSRS (Reporting Services) copy
+
+The SSRS copy action uses the **ReportService2010 SOAP web service** on both
+source and target ReportServer endpoints (default
+`http://chbbbid2/ReportServer` and `http://localhost/ReportServer`) plus the
+**ReportServer REST v2.0** API (`/Reports/api/v2.0`) for KPI / mobile report
+objects on SSRS 2016 and later.
+
+Requirements:
+
+- A PowerShell host that exposes `New-WebServiceProxy`. This ships with
+  Windows PowerShell 5.1 and is present on PowerShell 7.x on Windows.
+- Network reachability and HTTP(S) access from the workstation running the
+  script to both `<source>/ReportServer` and `<target>/ReportServer`.
+- A Windows account that can call:
+  - `ListRoles`, `CreateRole` (system policy administration) on the target.
+  - `CreateFolder`, `CreateCatalogItem`, `SetItemDataSources`,
+    `SetPolicies`, `CreateSchedule`, `CreateSubscription` on the target.
+  - `GetItemDefinition`, `GetPolicies`, `ListSubscriptions`,
+    `GetSubscriptionProperties` on the source.
+- For KPIs and mobile reports: SSRS 2016+ with the portal (`/Reports`)
+  enabled on the target.
+
+No additional PowerShell module is required for SSRS - the copy does not
+depend on `dbatools` for this area. `New-WebServiceProxy` dynamically
+generates the SOAP client from the ReportService2010 WSDL at runtime.
+
+Known portability limits:
+
+- Encrypted columns in the ReportServer database (stored data-source
+  credentials, subscription delivery credentials) are bound to the source
+  server's symmetric key. Over SOAP they surface as empty strings on the
+  target. Re-enter them on the target or use an SSRS encryption-key
+  backup/restore out of band.
+- `CreateSubscription` fails if the owner principal does not exist on the
+  target. Run the login copy first.
+
 ## Optional tools
 
 - **`git`** for version control.

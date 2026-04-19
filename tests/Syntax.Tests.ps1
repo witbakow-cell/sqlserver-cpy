@@ -66,7 +66,12 @@ $cfgPath = Join-Path -Path $repoRoot -ChildPath 'config/default.psd1'
 try {
     $cfg = Import-PowerShellDataFile -Path $cfgPath
     $requiredKeys = @('EncryptConnection', 'TrustServerCertificate', 'ConnectionTimeoutSeconds',
-                      'SourceServer', 'TargetServer', 'DryRun', 'Areas')
+                      'SourceServer', 'TargetServer', 'DryRun', 'Areas',
+                      'LoginSkipPrefixes', 'SourceSsrsUri', 'TargetSsrsUri',
+                      'CopySsrsFolders','CopySsrsReports','CopySsrsDatasets',
+                      'CopySsrsDataSources','CopySsrsResources','CopySsrsSecurity',
+                      'CopySsrsRoles','CopySsrsSubscriptions','CopySsrsSchedules',
+                      'CopySsrsKpis')
     foreach ($k in $requiredKeys) {
         if (-not $cfg.ContainsKey($k)) {
             $failures += [pscustomobject]@{
@@ -77,9 +82,145 @@ try {
             Write-Host "  OK  key '$k' = $($cfg[$k])"
         }
     }
+
+    # LoginSkipPrefixes must include the four user-mandated prefixes.
+    $mustHavePrefixes = @('NT AUTHORITY','NT SERVICE','BUILTIN','ADIS')
+    $have = @()
+    if ($cfg.ContainsKey('LoginSkipPrefixes') -and $cfg.LoginSkipPrefixes) {
+        $have = @($cfg.LoginSkipPrefixes)
+    }
+    foreach ($p in $mustHavePrefixes) {
+        if ($have -notcontains $p) {
+            $failures += [pscustomobject]@{
+                File   = $cfgPath
+                Errors = "LoginSkipPrefixes missing required prefix: $p"
+            }
+        } else {
+            Write-Host "  OK  LoginSkipPrefixes contains '$p'"
+        }
+    }
+
+    # Areas should have the new SsrsCatalog flag.
+    if (-not $cfg.Areas.ContainsKey('SsrsCatalog')) {
+        $failures += [pscustomobject]@{
+            File   = $cfgPath
+            Errors = "Areas missing SsrsCatalog flag"
+        }
+    } else {
+        Write-Host "  OK  Areas.SsrsCatalog = $($cfg.Areas.SsrsCatalog)"
+    }
 } catch {
     $failures += [pscustomobject]@{
         File   = $cfgPath
+        Errors = $_.Exception.Message
+    }
+}
+
+Write-Host ''
+Write-Host 'Checking manifest exports SSRS + login-skip functions...' -ForegroundColor Cyan
+if ($manifest) {
+    $ssrsExports = @(
+        'Invoke-SqlCpySsrsCopy'
+        'Get-SqlCpySsrsProxy'
+        'Get-SqlCpySsrsRestBase'
+        'Get-SqlCpySsrsCatalogItems'
+        'New-SqlCpySsrsFolderTree'
+        'Copy-SqlCpySsrsCatalogItem'
+        'Copy-SqlCpySsrsItemPolicies'
+        'Copy-SqlCpySsrsRoles'
+        'Copy-SqlCpySsrsSchedules'
+        'Copy-SqlCpySsrsSubscriptions'
+        'Test-SqlCpyLoginSkipped'
+    )
+    foreach ($fn in $ssrsExports) {
+        if ($manifest.FunctionsToExport -notcontains $fn) {
+            $failures += [pscustomobject]@{
+                File   = $manifestPath
+                Errors = "FunctionsToExport missing: $fn"
+            }
+        } else {
+            Write-Host "  OK  exports $fn"
+        }
+    }
+}
+
+Write-Host ''
+Write-Host 'Dot-sourcing Logins.ps1 and probing Test-SqlCpyLoginSkipped...' -ForegroundColor Cyan
+$loginsFile = Join-Path -Path $repoRoot -ChildPath 'src/SqlServerCpy/Public/Logins.ps1'
+try {
+    . $loginsFile
+
+    $prefixes = @('NT AUTHORITY','NT SERVICE','BUILTIN','ADIS')
+
+    $cases = @(
+        @{ Name = 'NT AUTHORITY\SYSTEM';               Expected = $true  }
+        @{ Name = 'NT SERVICE\MSSQL$INST';             Expected = $true  }
+        @{ Name = 'BUILTIN\Administrators';            Expected = $true  }
+        @{ Name = 'ADIS\sqlagent';                     Expected = $true  }
+        @{ Name = 'ADIS_TeamA_ReadOnly';               Expected = $true  }
+        @{ Name = 'MYDOMAIN\BUILTIN\Administrators';   Expected = $true  }
+        @{ Name = 'nt authority\network service';      Expected = $true  }
+        @{ Name = 'MYDOMAIN\alice';                    Expected = $false }
+        @{ Name = 'sa';                                Expected = $false }
+        @{ Name = '';                                  Expected = $false }
+        @{ Name = 'ntauthority';                       Expected = $false }
+        @{ Name = 'ADISON\bob';                        Expected = $false }
+    )
+
+    foreach ($c in $cases) {
+        $got = Test-SqlCpyLoginSkipped -LoginName $c.Name -SkipPrefixes $prefixes
+        if ($got -ne $c.Expected) {
+            $failures += [pscustomobject]@{
+                File   = $loginsFile
+                Errors = "Test-SqlCpyLoginSkipped('{0}') = {1}, expected {2}" -f $c.Name, $got, $c.Expected
+            }
+        } else {
+            Write-Host ("  OK  Test-SqlCpyLoginSkipped('{0}') = {1}" -f $c.Name, $got)
+        }
+    }
+
+    # Empty / null prefix list must never skip anything.
+    if (Test-SqlCpyLoginSkipped -LoginName 'BUILTIN\Administrators' -SkipPrefixes @()) {
+        $failures += [pscustomobject]@{
+            File   = $loginsFile
+            Errors = "Test-SqlCpyLoginSkipped must return false when SkipPrefixes is empty."
+        }
+    } else {
+        Write-Host "  OK  Empty SkipPrefixes -> no skip"
+    }
+} catch {
+    $failures += [pscustomobject]@{
+        File   = $loginsFile
+        Errors = $_.Exception.Message
+    }
+}
+
+Write-Host ''
+Write-Host 'Checking Ssrs.ps1 parses and Get-SqlCpySsrsRestBase behaves...' -ForegroundColor Cyan
+$ssrsFile = Join-Path -Path $repoRoot -ChildPath 'src/SqlServerCpy/Public/Ssrs.ps1'
+try {
+    . $ssrsFile
+    $rest1 = Get-SqlCpySsrsRestBase -Uri 'http://chbbbid2/ReportServer'
+    if ($rest1 -ne 'http://chbbbid2/Reports/api/v2.0') {
+        $failures += [pscustomobject]@{
+            File   = $ssrsFile
+            Errors = "Get-SqlCpySsrsRestBase derived '$rest1' from ReportServer URL."
+        }
+    } else {
+        Write-Host "  OK  REST base = $rest1"
+    }
+    $rest2 = Get-SqlCpySsrsRestBase -Uri 'https://reports.example.com:8080/ReportServer/'
+    if ($rest2 -notmatch '^https://reports\.example\.com:8080/Reports/api/v2\.0$') {
+        $failures += [pscustomobject]@{
+            File   = $ssrsFile
+            Errors = "Get-SqlCpySsrsRestBase derived '$rest2' for HTTPS URL."
+        }
+    } else {
+        Write-Host "  OK  REST base (https) = $rest2"
+    }
+} catch {
+    $failures += [pscustomobject]@{
+        File   = $ssrsFile
         Errors = $_.Exception.Message
     }
 }

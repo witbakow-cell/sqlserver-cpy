@@ -49,10 +49,11 @@ function Start-SqlCpyInteractive {
         Write-Host '  3) Copy logins'
         Write-Host '  4) Copy SQL Agent jobs'
         Write-Host '  5) Copy SSIS catalog (folders, projects, environments)'
-        Write-Host '  6) Copy selected databases (schema-only, no data)'
-        Write-Host '  7) Change source / target / DryRun'
-        Write-Host '  8) Change connection security (Encrypt / TrustServerCertificate / Timeout)'
-        Write-Host '  9) Preflight: test connectivity to source and target'
+        Write-Host '  6) Copy SSRS assets (reports, datasets, folders, roles, security, subscriptions)'
+        Write-Host '  7) Copy selected databases (schema-only, no data)'
+        Write-Host '  8) Change source / target / DryRun'
+        Write-Host '  9) Change connection security (Encrypt / TrustServerCertificate / Timeout)'
+        Write-Host '  P) Preflight: test connectivity to source and target'
         Write-Host '  0) Exit'
         Write-Host ''
 
@@ -103,6 +104,24 @@ function Start-SqlCpyInteractive {
                         -Config       $cfg
                 }
                 '6' {
+                    # SSRS copy uses the ReportServer web service on each side; the SQL-side
+                    # preflight is not required, but run it so connection/trust settings are
+                    # validated if the user has a local SSRS that shares the SQL host.
+                    $srcUri = $cfg.SourceSsrsUri
+                    $tgtUri = $cfg.TargetSsrsUri
+                    if (-not $srcUri) { $srcUri = 'http://{0}/ReportServer' -f $cfg.SourceServer }
+                    if (-not $tgtUri) { $tgtUri = 'http://{0}/ReportServer' -f $cfg.TargetServer }
+                    $root = '/'
+                    if ($cfg.ContainsKey('SsrsRootPath') -and $cfg.SsrsRootPath) { $root = $cfg.SsrsRootPath }
+
+                    Invoke-SqlCpySsrsCopy `
+                        -SourceUri $srcUri `
+                        -TargetUri $tgtUri `
+                        -RootPath  $root `
+                        -DryRun    $cfg.DryRun `
+                        -Config    $cfg
+                }
+                '7' {
                     if (-not (Test-SqlCpyPreflight -Config $cfg)) { continue }
                     $dbs = $cfg.SchemaOnlyDatabaseList
                     if (-not $dbs -or $dbs.Count -eq 0) {
@@ -118,7 +137,7 @@ function Start-SqlCpyInteractive {
                         -DryRun       $cfg.DryRun `
                         -Config       $cfg
                 }
-                '7' {
+                '8' {
                     $s = Read-Host ("Source [{0}]" -f $cfg.SourceServer)
                     if ($s) { $cfg.SourceServer = $s }
                     $t = Read-Host ("Target [{0}]" -f $cfg.TargetServer)
@@ -127,7 +146,7 @@ function Start-SqlCpyInteractive {
                     if ($d -match '^(?i)y') { $cfg.DryRun = $true }
                     elseif ($d -match '^(?i)n') { $cfg.DryRun = $false }
                 }
-                '8' {
+                '9' {
                     $e = Read-Host ("EncryptConnection [{0}] (y/n)" -f $cfg.EncryptConnection)
                     if ($e -match '^(?i)y') { $cfg.EncryptConnection = $true }
                     elseif ($e -match '^(?i)n') { $cfg.EncryptConnection = $false }
@@ -139,7 +158,7 @@ function Start-SqlCpyInteractive {
                     $to = Read-Host ("ConnectionTimeoutSeconds [{0}]" -f $cfg.ConnectionTimeoutSeconds)
                     if ($to -match '^\d+$') { $cfg.ConnectionTimeoutSeconds = [int]$to }
                 }
-                '9' {
+                { $_ -match '^(?i)p$' } {
                     [void](Test-SqlCpyPreflight -Config $cfg)
                 }
                 '0' { return }

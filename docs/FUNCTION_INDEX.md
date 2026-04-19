@@ -96,6 +96,13 @@ read the help block.
 
 - **`Invoke-SqlCpyLoginCopy`** (`src/SqlServerCpy/Public/Logins.ps1`)
   — Copies logins and database-user mappings via `Copy-DbaLogin`. Honours DryRun.
+  Filters out logins that match any prefix in `Config.LoginSkipPrefixes`
+  (defaults: `NT AUTHORITY`, `NT SERVICE`, `BUILTIN`, `ADIS`) and logs every
+  skipped entry.
+- **`Test-SqlCpyLoginSkipped`** (`src/SqlServerCpy/Public/Logins.ps1`)
+  — Pure predicate used by the copy path; case-insensitive prefix check that
+  strips an outer domain qualifier so `MYDOMAIN\BUILTIN\Administrators` still
+  matches `BUILTIN`.
 
 ## SQL Agent
 
@@ -108,6 +115,43 @@ read the help block.
   — Copies SSISDB folders, projects, environments, references via `Copy-DbaSsisCatalog`.
   Honours DryRun. See the function's help block for caveats on sensitive environment
   variables.
+
+## SSRS (Reporting Services)
+
+SSRS copy talks to the **ReportService2010 SOAP** endpoint on both sides (plus
+REST v2.0 where available for KPIs) rather than copying the ReportServer
+catalog database. The orchestrator attempts every class of asset; individual
+phase failures are logged and do not abort the rest.
+
+- **`Invoke-SqlCpySsrsCopy`** (`src/SqlServerCpy/Public/Ssrs.ps1`)
+  — Top-level orchestrator. Copies roles, schedules, folders, data sources,
+  datasets, resources, reports, item-level policies, subscriptions and KPIs.
+  Honours DryRun; reads the `CopySsrs*` toggles from config.
+- **`Get-SqlCpySsrsProxy`** (`src/SqlServerCpy/Public/Ssrs.ps1`)
+  — Opens a `New-WebServiceProxy` handle to `<uri>/ReportService2010.asmx?wsdl`
+  under Windows default credentials (or an explicit `PSCredential`).
+- **`Get-SqlCpySsrsRestBase`** (`src/SqlServerCpy/Public/Ssrs.ps1`)
+  — Derives the `/Reports/api/v2.0` REST base URL from a ReportServer URL.
+- **`Get-SqlCpySsrsCatalogItems`** (`src/SqlServerCpy/Public/Ssrs.ps1`)
+  — Recursively lists every catalog item under a path via `ListChildren`.
+- **`New-SqlCpySsrsFolderTree`** (`src/SqlServerCpy/Public/Ssrs.ps1`)
+  — Creates folders parent-first on the target; no-op for existing folders.
+- **`Copy-SqlCpySsrsCatalogItem`** (`src/SqlServerCpy/Public/Ssrs.ps1`)
+  — Copies a single Report / DataSet / DataSource / Resource via
+  `GetItemDefinition` + `CreateCatalogItem`; for reports also replays
+  `SetItemDataSources` / `SetItemReferences` so shared references rebind.
+- **`Copy-SqlCpySsrsItemPolicies`** (`src/SqlServerCpy/Public/Ssrs.ps1`)
+  — Copies item-level security (role assignments) via
+  `GetPolicies`/`SetPolicies`, honouring inheritance.
+- **`Copy-SqlCpySsrsRoles`** (`src/SqlServerCpy/Public/Ssrs.ps1`)
+  — Copies system + catalog role **definitions** (`ListRoles`,
+  `GetRoleProperties`, `CreateRole`).
+- **`Copy-SqlCpySsrsSchedules`** (`src/SqlServerCpy/Public/Ssrs.ps1`)
+  — Copies shared schedules (`ListSchedules`, `CreateSchedule`).
+- **`Copy-SqlCpySsrsSubscriptions`** (`src/SqlServerCpy/Public/Ssrs.ps1`)
+  — Best-effort subscription copy (`ListSubscriptions`,
+  `GetSubscriptionProperties`, `CreateSubscription`). Encrypted delivery
+  credentials are not portable over SOAP - the function logs this.
 
 ## Schema-only database copy
 

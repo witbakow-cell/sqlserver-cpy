@@ -13,6 +13,9 @@ The project targets the following asset categories:
 - SQL Server Agent jobs
 - SSISDB catalog configuration (folders, references, permissions)
 - SSIS projects and environments
+- **SSRS (Reporting Services) assets: reports, datasets, data sources,
+  resources, folders, item-level security, role definitions, shared
+  schedules, subscriptions, and KPIs/mobile reports**
 - SQL Server users and logins
 - Selected database schemas (schema-only, no data)
 - SQL Server server-level configuration (compare and equalize)
@@ -176,6 +179,79 @@ The launcher will:
 ├── DECISIONS_AND_CAVEATS.txt    # Architectural choices, observations, caveats
 └── README.md
 ```
+
+## Login copy: skipped prefixes
+
+The login copy step filters out principals that are machine-local or otherwise
+not portable. The default list lives in `config/default.psd1` under
+`LoginSkipPrefixes`:
+
+```powershell
+LoginSkipPrefixes = @(
+    'NT AUTHORITY'
+    'NT SERVICE'
+    'BUILTIN'
+    'ADIS'
+)
+```
+
+Matching is case-insensitive. A single leading `<domain>\` qualifier is
+stripped before comparison, so `MYDOMAIN\BUILTIN\Administrators` still matches
+`BUILTIN`. Skipped logins are logged individually so you can see exactly what
+was dropped. Override the list in `config/local.psd1` if you need to include
+(or further exclude) a prefix.
+
+## SSRS (Reporting Services) copy
+
+Option **6) Copy SSRS assets** in the TUI migrates an entire SSRS catalog over
+the **ReportService2010 SOAP** API (plus REST v2.0 for KPIs where the target
+exposes it). It does **not** copy the ReportServer / ReportServerTempDB
+catalog databases directly: that path is version-specific and pulls in
+symmetric keys that are bound to the source machine.
+
+The copy attempts, in order:
+
+1. Role definitions (system + catalog)
+2. Shared schedules
+3. Folder tree
+4. Shared data sources
+5. Shared datasets
+6. Resources (images, xlsx, pdf, …)
+7. Reports (and linked reports; shared references are rebound)
+8. Item-level security (policies) for every copied item
+9. Subscriptions (best-effort)
+10. KPIs / mobile reports via REST (SSRS 2016+)
+
+Defaults:
+
+```powershell
+SourceSsrsUri = 'http://chbbbid2/ReportServer'
+TargetSsrsUri = 'http://localhost/ReportServer'
+SsrsRootPath  = '/'
+```
+
+Per-asset toggles (`CopySsrsFolders`, `CopySsrsReports`, `CopySsrsDatasets`,
+`CopySsrsDataSources`, `CopySsrsResources`, `CopySsrsSecurity`,
+`CopySsrsRoles`, `CopySsrsSubscriptions`, `CopySsrsSchedules`,
+`CopySsrsKpis`) all default to `$true` because the explicit requirement is
+not to skip any class of SSRS asset. Flip them off in `config/local.psd1` if
+a given class does not apply.
+
+Known caveats (also in `DECISIONS_AND_CAVEATS.txt`):
+
+- Stored credentials on data sources and the delivery credentials on
+  subscriptions are encrypted with the source server's symmetric key and are
+  **not portable over SOAP**. The scaffold copies the item with blank
+  credential fields and logs a WARN line so you can re-enter them on the
+  target (or use an SSRS encryption-key backup/restore).
+- `CreateSubscription` needs the subscription owner to exist on the target.
+  Copy logins first.
+- Data-driven subscriptions (`CreateDataDrivenSubscription`) and some older
+  KPI shapes may not round-trip cleanly; the scaffold logs these as WARN and
+  keeps going.
+
+Running the SSRS copy requires a PowerShell host with `New-WebServiceProxy`
+(Windows PowerShell 5.1, or PowerShell 7.x on Windows).
 
 ## Safety defaults
 
