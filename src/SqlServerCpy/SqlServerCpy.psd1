@@ -22,6 +22,8 @@
         'Get-SqlCpyCopySplat'
         'Get-SqlCpyDbaInstance'
         'Get-SqlCpyConnectionErrorHint'
+        'Get-SqlCpyCommandParameter'
+        'Resolve-SqlCpyParameterName'
         'Test-SqlCpyPreflight'
         'Write-SqlCpyStep'
         'Write-SqlCpyInfo'

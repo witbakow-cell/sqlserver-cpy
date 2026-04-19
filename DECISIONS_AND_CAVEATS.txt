@@ -84,6 +84,26 @@ Observed issue resolved
   a clear diagnostic if the user has flipped it off and the handshake
   still fails.
 
+- ERROR: Source connection failed: A parameter cannot be found that
+  matches parameter name 'ConnectionTimeout'.
+  Root cause: the initial scaffold unconditionally added
+  -ConnectionTimeout to every splat. dbatools 2.x does not expose that
+  parameter on several cmdlets we call (Get-DbaSpConfigure,
+  Copy-DbaSpConfigure, Copy-DbaLogin, Copy-DbaAgentJob,
+  Copy-DbaSsisCatalog). Splatting the missing parameter aborted TUI
+  action 1 ("Compare server configuration") at preflight.
+  Fix shipped here: Get-SqlCpyConnectionSplat and Get-SqlCpyCopySplat
+  now accept -CommandName and filter the returned hashtable against the
+  named command's real parameter set (via Get-Command). If the command
+  accepts -ConnectionTimeout, ConnectTimeout, or StatementTimeout the
+  configured value is routed to whichever name is supported; if none is,
+  the timeout is silently skipped for that call. ConnectionTimeoutSeconds
+  remains in config because it is still useful for Connect-DbaInstance
+  and Invoke-DbaQuery, which DO expose it. Callers were updated to pass
+  -CommandName (ServerConfig / Logins / AgentJobs / SchemaOnlyDatabase /
+  SsisCatalog). Get-SqlCpyConnectionErrorHint additionally recognises
+  the parameter-binding error text and prints an actionable hint.
+
 Observations
 ------------
 

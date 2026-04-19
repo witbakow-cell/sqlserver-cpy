@@ -93,6 +93,8 @@ if ($manifest) {
         'Get-SqlCpyDbaInstance'
         'Test-SqlCpyPreflight'
         'Get-SqlCpyConnectionErrorHint'
+        'Get-SqlCpyCommandParameter'
+        'Resolve-SqlCpyParameterName'
     )
     foreach ($fn in $mustExport) {
         if ($manifest.FunctionsToExport -notcontains $fn) {
@@ -123,18 +125,89 @@ try {
         TrustServerCertificate   = $true
         ConnectionTimeoutSeconds = 15
     }
+
+    # ---- Case 1: no command name + dbatools absent -> conservative splat.
+    # The bug this guards against: scaffold v0.1 always emitted
+    # -ConnectionTimeout, which fails on cmdlets that do not expose it.
     $splat = Get-SqlCpyConnectionSplat -Config $probeCfg -Server 'chbbbid2'
-    foreach ($k in 'SqlInstance', 'EncryptConnection', 'TrustServerCertificate', 'ConnectionTimeout') {
+    foreach ($k in 'SqlInstance', 'EncryptConnection', 'TrustServerCertificate') {
         if (-not $splat.ContainsKey($k)) {
             $failures += [pscustomobject]@{
                 File   = $connFile
-                Errors = "Get-SqlCpyConnectionSplat result missing key: $k"
+                Errors = "Get-SqlCpyConnectionSplat (no -CommandName) missing universal key: $k"
             }
         } else {
-            Write-Host "  OK  splat has $k = $($splat[$k])"
+            Write-Host "  OK  splat (no cmd) has $k = $($splat[$k])"
+        }
+    }
+    if ($splat.ContainsKey('ConnectionTimeout')) {
+        $failures += [pscustomobject]@{
+            File   = $connFile
+            Errors = "Get-SqlCpyConnectionSplat (no -CommandName) should NOT include ConnectionTimeout by default; got $($splat.ConnectionTimeout)"
+        }
+    } else {
+        Write-Host "  OK  splat (no cmd) correctly omitted ConnectionTimeout"
+    }
+
+    # ---- Case 2: simulated command that SUPPORTS ConnectionTimeout.
+    $supported = @('SqlInstance','SqlCredential','EncryptConnection','TrustServerCertificate','ConnectionTimeout')
+    $splat2 = Get-SqlCpyConnectionSplat -Config $probeCfg -Server 'chbbbid2' -SimulatedParameters $supported
+    if (-not $splat2.ContainsKey('ConnectionTimeout') -or $splat2.ConnectionTimeout -ne 15) {
+        $failures += [pscustomobject]@{
+            File   = $connFile
+            Errors = "Simulated command supporting ConnectionTimeout should include it; got $($splat2.ConnectionTimeout)"
+        }
+    } else {
+        Write-Host "  OK  simulated-supported splat has ConnectionTimeout = $($splat2.ConnectionTimeout)"
+    }
+
+    # ---- Case 3: simulated command that does NOT expose ConnectionTimeout
+    # (the dbatools 2.x Get-DbaSpConfigure / Copy-Dba* case -> root cause of
+    #  "A parameter cannot be found that matches parameter name 'ConnectionTimeout'").
+    $noTimeout = @('SqlInstance','SqlCredential','EncryptConnection','TrustServerCertificate')
+    $splat3 = Get-SqlCpyConnectionSplat -Config $probeCfg -Server 'chbbbid2' -SimulatedParameters $noTimeout
+    if ($splat3.ContainsKey('ConnectionTimeout')) {
+        $failures += [pscustomobject]@{
+            File   = $connFile
+            Errors = "Simulated command WITHOUT ConnectionTimeout must not receive it; got $($splat3.ConnectionTimeout)"
+        }
+    } else {
+        Write-Host "  OK  simulated-unsupported splat correctly omitted ConnectionTimeout"
+    }
+    foreach ($k in 'SqlInstance','EncryptConnection','TrustServerCertificate') {
+        if (-not $splat3.ContainsKey($k)) {
+            $failures += [pscustomobject]@{
+                File   = $connFile
+                Errors = "Simulated-unsupported splat missing universal key $k"
+            }
         }
     }
 
+    # ---- Case 4: simulated command that only speaks -ConnectTimeout alias.
+    $altName = @('SqlInstance','SqlCredential','EncryptConnection','TrustServerCertificate','ConnectTimeout')
+    $splat4 = Get-SqlCpyConnectionSplat -Config $probeCfg -Server 'chbbbid2' -SimulatedParameters $altName
+    if (-not $splat4.ContainsKey('ConnectTimeout') -or $splat4.ContainsKey('ConnectionTimeout')) {
+        $failures += [pscustomobject]@{
+            File   = $connFile
+            Errors = "Alternate-named timeout parameter not routed correctly: keys=$(@($splat4.Keys) -join ',')"
+        }
+    } else {
+        Write-Host "  OK  routed timeout to alternate parameter -ConnectTimeout = $($splat4.ConnectTimeout)"
+    }
+
+    # ---- Case 5: Get-SqlCpyCopySplat filters the same way.
+    $copyNoTimeout = @('Source','Destination','EncryptConnection','TrustServerCertificate','SourceSqlCredential','DestinationSqlCredential')
+    $copySplat = Get-SqlCpyCopySplat -Config $probeCfg -Source 'a' -Destination 'b' -SimulatedParameters $copyNoTimeout
+    if ($copySplat.ContainsKey('ConnectionTimeout')) {
+        $failures += [pscustomobject]@{
+            File   = $connFile
+            Errors = "Get-SqlCpyCopySplat: ConnectionTimeout leaked into splat when command does not accept it"
+        }
+    } else {
+        Write-Host "  OK  Get-SqlCpyCopySplat filtered ConnectionTimeout correctly"
+    }
+
+    # ---- Case 6: error-hint maps the parameter-binding message to a helpful string.
     $hint = Get-SqlCpyConnectionErrorHint -Message 'The certificate chain was issued by an authority that is not trusted' -Config $probeCfg
     if (-not $hint) {
         $failures += [pscustomobject]@{
@@ -143,6 +216,16 @@ try {
         }
     } else {
         Write-Host "  OK  cert-chain hint: $hint"
+    }
+
+    $paramHint = Get-SqlCpyConnectionErrorHint -Message "A parameter cannot be found that matches parameter name 'ConnectionTimeout'." -Config $probeCfg
+    if ($paramHint -notmatch 'parameter') {
+        $failures += [pscustomobject]@{
+            File   = $connFile
+            Errors = "Get-SqlCpyConnectionErrorHint did not map parameter-binding error: $paramHint"
+        }
+    } else {
+        Write-Host "  OK  param-binding hint: $paramHint"
     }
 } catch {
     $failures += [pscustomobject]@{

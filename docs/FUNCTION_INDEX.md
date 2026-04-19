@@ -17,12 +17,25 @@ read the help block.
 ## Connection / preflight
 
 - **`Get-SqlCpyConnectionSplat`** (`src/SqlServerCpy/Public/Connection.ps1`)
-  — Builds a hashtable with `SqlInstance`, `EncryptConnection`, `TrustServerCertificate`,
-  `ConnectionTimeout`, `SqlCredential` for splatting onto `dbatools` cmdlets that take
-  `-SqlInstance` (e.g. `Get-DbaSpConfigure`, `Get-DbaLogin`, `Invoke-DbaQuery`).
+  — Builds a hashtable of connection-security parameters (`SqlInstance`,
+  `EncryptConnection`, `TrustServerCertificate`, `SqlCredential`, and a timeout if
+  supported) filtered to match the parameter set of the target cmdlet. Pass
+  `-CommandName` with the dbatools cmdlet you are about to invoke (e.g.
+  `Get-DbaSpConfigure`, `Get-DbaLogin`, `Invoke-DbaQuery`). Without
+  `-CommandName`, the splat omits any command-version-sensitive parameter to stay
+  safe.
 - **`Get-SqlCpyCopySplat`** (`src/SqlServerCpy/Public/Connection.ps1`)
-  — Same idea for `Copy-Dba*` cmdlets that take `-Source` / `-Destination`
-  (`Copy-DbaLogin`, `Copy-DbaAgentJob`, `Copy-DbaSsisCatalog`, `Copy-DbaSpConfigure`).
+  — Same idea for `Copy-Dba*` cmdlets that take `-Source` / `-Destination`. Also
+  respects `-CommandName` filtering.
+- **`Get-SqlCpyCommandParameter`** (`src/SqlServerCpy/Public/Connection.ps1`)
+  — Returns the parameter names (and alias map) a given command exposes, via
+  `Get-Command`. Supports a `-Simulated` list for tests that must not depend on
+  dbatools being installed.
+- **`Resolve-SqlCpyParameterName`** (`src/SqlServerCpy/Public/Connection.ps1`)
+  — Given a parameter-set hashtable and a priority-ordered list of candidate
+  names, returns the first name the command actually accepts (parameter or
+  alias). Used to route a configured timeout into whatever name the installed
+  dbatools version uses.
 - **`Get-SqlCpyDbaInstance`** (`src/SqlServerCpy/Public/Connection.ps1`)
   — Opens a `Connect-DbaInstance` SMO handle honouring the connection-security config.
   Use this when a downstream cmdlet does not expose `-EncryptConnection` /

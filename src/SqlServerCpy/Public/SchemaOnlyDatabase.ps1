@@ -77,7 +77,7 @@ function Invoke-SqlCpySchemaOnlyDatabaseCopy {
         }
 
         Write-SqlCpyInfo "Applying script to target: $db"
-        $tgtSplat = Get-SqlCpyConnectionSplat -Config $Config -Server $TargetServer -Credential $Config.TargetCredential
+        $tgtSplat = Get-SqlCpyConnectionSplat -Config $Config -Server $TargetServer -Credential $Config.TargetCredential -CommandName 'Invoke-DbaQuery'
         Invoke-DbaQuery @tgtSplat -Database $db -File $scriptPath -EnableException
     }
 }

@@ -49,8 +49,8 @@ function Invoke-SqlCpyServerConfigCompare {
 
     Write-SqlCpyStep "Comparing server configuration: $SourceServer -> $TargetServer"
 
-    $srcSplat = Get-SqlCpyConnectionSplat -Config $Config -Server $SourceServer -Credential $Config.SourceCredential
-    $tgtSplat = Get-SqlCpyConnectionSplat -Config $Config -Server $TargetServer -Credential $Config.TargetCredential
+    $srcSplat = Get-SqlCpyConnectionSplat -Config $Config -Server $SourceServer -Credential $Config.SourceCredential -CommandName 'Get-DbaSpConfigure'
+    $tgtSplat = Get-SqlCpyConnectionSplat -Config $Config -Server $TargetServer -Credential $Config.TargetCredential -CommandName 'Get-DbaSpConfigure'
 
     try {
         $src = Get-DbaSpConfigure @srcSplat -EnableException
@@ -141,7 +141,7 @@ function Invoke-SqlCpyServerConfigApply {
         return
     }
 
-    $copySplat = Get-SqlCpyCopySplat -Config $Config -Source $SourceServer -Destination $TargetServer
+    $copySplat = Get-SqlCpyCopySplat -Config $Config -Source $SourceServer -Destination $TargetServer -CommandName 'Copy-DbaSpConfigure'
 
     foreach ($d in $diff) {
         $msg = "{0}: {1} -> {2}" -f $d.Name, $d.TargetValue, $d.SourceValue

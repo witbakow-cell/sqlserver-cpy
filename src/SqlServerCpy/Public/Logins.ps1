@@ -45,14 +45,14 @@ function Invoke-SqlCpyLoginCopy {
 
     Write-SqlCpyStep "Copying logins: $SourceServer -> $TargetServer (DryRun=$DryRun)"
 
-    $srcSplat = Get-SqlCpyConnectionSplat -Config $Config -Server $SourceServer -Credential $Config.SourceCredential
+    $srcSplat = Get-SqlCpyConnectionSplat -Config $Config -Server $SourceServer -Credential $Config.SourceCredential -CommandName 'Get-DbaLogin'
     $logins = Get-DbaLogin @srcSplat |
         Where-Object {
             $_.Name -notlike '##*' -and $_.Name -ne 'sa' -and
             ((-not $LoginFilter) -or ($LoginFilter -contains $_.Name))
         }
 
-    $copySplat = Get-SqlCpyCopySplat -Config $Config -Source $SourceServer -Destination $TargetServer
+    $copySplat = Get-SqlCpyCopySplat -Config $Config -Source $SourceServer -Destination $TargetServer -CommandName 'Copy-DbaLogin'
 
     foreach ($l in $logins) {
         if ($DryRun) {

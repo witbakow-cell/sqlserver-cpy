@@ -71,3 +71,31 @@ These are forwarded to every `dbatools` cmdlet through the centralized helpers
 `Get-SqlCpyConnectionSplat` / `Get-SqlCpyCopySplat`. Use the TUI `Preflight` option or
 call `Test-SqlCpyPreflight` directly to validate both endpoints before running migration
 steps.
+
+### dbatools parameter compatibility
+
+Not every `dbatools` cmdlet accepts the same set of connection parameters. For example,
+`-ConnectionTimeout` is exposed on `Connect-DbaInstance` but **not** on
+`Get-DbaSpConfigure`, `Copy-DbaSpConfigure`, `Copy-DbaLogin`, `Copy-DbaAgentJob`, or
+`Copy-DbaSsisCatalog` in the 2.x line. Blindly splatting `-ConnectionTimeout` onto those
+commands fails with:
+
+> `A parameter cannot be found that matches parameter name 'ConnectionTimeout'.`
+
+To avoid this, `Get-SqlCpyConnectionSplat` and `Get-SqlCpyCopySplat` now take an optional
+`-CommandName` and introspect that command via `Get-Command`:
+
+1. If the command accepts `-ConnectionTimeout`, the configured
+   `ConnectionTimeoutSeconds` is forwarded under that name.
+2. If the command accepts an alternate name (currently `-ConnectTimeout` or
+   `-StatementTimeout`), it is routed there instead.
+3. If the command accepts none, the timeout is **silently skipped** for that call.
+   Keep `ConnectionTimeoutSeconds` in config — it is still honoured by
+   `Connect-DbaInstance` / `Invoke-DbaQuery` and by the preflight check.
+
+The same logic gates `-EncryptConnection` and `-TrustServerCertificate` where a given
+command version does not accept them.
+
+If you find a `dbatools` cmdlet that exposes a timeout under yet another name, add it
+to the `Candidates` list inside `Get-SqlCpyConnectionSplat` (`src/SqlServerCpy/Public/Connection.ps1`)
+and it will be routed automatically.

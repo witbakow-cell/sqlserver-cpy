@@ -51,6 +51,33 @@ keys in `config/default.psd1`:
 These flow into every `dbatools` cmdlet the tool calls through `Get-SqlCpyConnectionSplat`
 / `Get-SqlCpyCopySplat`, so you only configure them once.
 
+### dbatools parameter compatibility
+
+`dbatools` cmdlets do **not** all expose the same connection parameters. Most notably,
+`-ConnectionTimeout` exists on `Connect-DbaInstance` and `Invoke-DbaQuery` but **not** on
+`Get-DbaSpConfigure`, `Copy-DbaSpConfigure`, `Copy-DbaLogin`, `Copy-DbaAgentJob`, or
+`Copy-DbaSsisCatalog` in the 2.x line. An earlier version of the scaffold added
+`-ConnectionTimeout` to every splat, which produced this error on the very first
+menu action:
+
+```
+ERROR  Source connection failed: A parameter cannot be found that matches parameter
+name 'ConnectionTimeout'.
+```
+
+The splat helpers now take an optional `-CommandName` and filter the emitted hashtable
+against the real parameter set of that cmdlet (via `Get-Command`). If the command does
+not expose any timeout parameter, the timeout is silently skipped for that call; your
+configured `ConnectionTimeoutSeconds` is still honoured by `Connect-DbaInstance` and
+`Invoke-DbaQuery`, including during Preflight. There is nothing you need to change in
+config — keep `ConnectionTimeoutSeconds` set to whatever suits your environment.
+
+If you add a new migration function, pass `-CommandName` to `Get-SqlCpyConnectionSplat`
+/ `Get-SqlCpyCopySplat` so the same filtering applies. See
+[`DEPENDENCIES.md`](DEPENDENCIES.md#dbatools-parameter-compatibility) for details and
+the list of parameter-name candidates the helpers try (`ConnectionTimeout`,
+`ConnectTimeout`, `StatementTimeout`).
+
 ### Security tradeoff
 
 `TrustServerCertificate = $true` is the default because this tool is intended for local

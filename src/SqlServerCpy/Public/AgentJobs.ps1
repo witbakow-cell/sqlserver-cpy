@@ -39,11 +39,11 @@ function Invoke-SqlCpyAgentJobCopy {
 
     Write-SqlCpyStep "Copying SQL Agent jobs: $SourceServer -> $TargetServer (DryRun=$DryRun)"
 
-    $srcSplat = Get-SqlCpyConnectionSplat -Config $Config -Server $SourceServer -Credential $Config.SourceCredential
+    $srcSplat = Get-SqlCpyConnectionSplat -Config $Config -Server $SourceServer -Credential $Config.SourceCredential -CommandName 'Get-DbaAgentJob'
     $jobs = Get-DbaAgentJob @srcSplat |
         Where-Object { (-not $JobFilter) -or ($JobFilter -contains $_.Name) }
 
-    $copySplat = Get-SqlCpyCopySplat -Config $Config -Source $SourceServer -Destination $TargetServer
+    $copySplat = Get-SqlCpyCopySplat -Config $Config -Source $SourceServer -Destination $TargetServer -CommandName 'Copy-DbaAgentJob'
 
     foreach ($j in $jobs) {
         if ($DryRun) {

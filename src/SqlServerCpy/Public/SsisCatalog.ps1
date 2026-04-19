@@ -58,7 +58,7 @@ function Invoke-SqlCpySsisCatalogCopy {
         return
     }
 
-    $params = Get-SqlCpyCopySplat -Config $Config -Source $SourceServer -Destination $TargetServer
+    $params = Get-SqlCpyCopySplat -Config $Config -Source $SourceServer -Destination $TargetServer -CommandName 'Copy-DbaSsisCatalog'
     $params['EnableException'] = $true
     if ($FolderFilter) { $params['Folder'] = $FolderFilter }
 
