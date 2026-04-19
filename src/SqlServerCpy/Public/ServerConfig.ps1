@@ -11,6 +11,14 @@ function Invoke-SqlCpyServerConfigCompare {
     Falls back to two Get-DbaSpConfigure calls and a local diff when a one-shot compare
     cmdlet is unavailable in the installed dbatools version.
 
+    Connection parameters (EncryptConnection, TrustServerCertificate, ConnectionTimeout)
+    are taken from the -Config hashtable via Get-SqlCpyConnectionSplat. This is where
+    the "certificate chain was issued by an authority that is not trusted" warning from
+    Get-DbaSpConfigure was coming from: dbatools now defaults to Encrypt=Mandatory with
+    strict chain validation. Passing TrustServerCertificate explicitly - or better,
+    running Test-SqlCpyPreflight first - surfaces the issue clearly instead of as a
+    silent WARN + empty result.
+
     This function is read-only - it does not modify either instance.
 
 .PARAMETER SourceServer
@@ -22,6 +30,10 @@ function Invoke-SqlCpyServerConfigCompare {
 .PARAMETER ExtendedChecks
     Optional array of extra check labels to include (see config/default.psd1).
 
+.PARAMETER Config
+    Config hashtable carrying connection-security settings. When omitted,
+    Get-SqlCpyConfig is called.
+
 .OUTPUTS
     PSCustomObject records, one per differing item.
 #>
@@ -29,15 +41,31 @@ function Invoke-SqlCpyServerConfigCompare {
     param(
         [Parameter(Mandatory)] [string]$SourceServer,
         [Parameter(Mandatory)] [string]$TargetServer,
-        [string[]]$ExtendedChecks
+        [string[]]$ExtendedChecks,
+        [hashtable]$Config
     )
+
+    if (-not $Config) { $Config = Get-SqlCpyConfig }
 
     Write-SqlCpyStep "Comparing server configuration: $SourceServer -> $TargetServer"
 
-    # TODO: Validate on a live environment. The exact cmdlet and property names below
-    # reflect current dbatools 2.x; verify before relying on them.
-    $src = Get-DbaSpConfigure -SqlInstance $SourceServer
-    $tgt = Get-DbaSpConfigure -SqlInstance $TargetServer
+    $srcSplat = Get-SqlCpyConnectionSplat -Config $Config -Server $SourceServer -Credential $Config.SourceCredential
+    $tgtSplat = Get-SqlCpyConnectionSplat -Config $Config -Server $TargetServer -Credential $Config.TargetCredential
+
+    try {
+        $src = Get-DbaSpConfigure @srcSplat -EnableException
+    } catch {
+        Write-SqlCpyError "Get-DbaSpConfigure failed on source '$SourceServer': $($_.Exception.Message)"
+        Write-SqlCpyInfo  (Get-SqlCpyConnectionErrorHint -Message $_.Exception.Message -Config $Config)
+        throw
+    }
+    try {
+        $tgt = Get-DbaSpConfigure @tgtSplat -EnableException
+    } catch {
+        Write-SqlCpyError "Get-DbaSpConfigure failed on target '$TargetServer': $($_.Exception.Message)"
+        Write-SqlCpyInfo  (Get-SqlCpyConnectionErrorHint -Message $_.Exception.Message -Config $Config)
+        throw
+    }
 
     $tgtMap = @{}
     foreach ($row in $tgt) { $tgtMap[$row.Name] = $row }
@@ -79,7 +107,8 @@ function Invoke-SqlCpyServerConfigApply {
 .DESCRIPTION
     Honours the DryRun flag: when $true, prints the intended changes without applying.
     When $false, uses dbatools (Copy-DbaSpConfigure or Set-DbaSpConfigure per item) to
-    apply the values.
+    apply the values. Connection parameters flow via Get-SqlCpyCopySplat so
+    TrustServerCertificate / EncryptConnection are consistent with the rest of the tool.
 
 .PARAMETER SourceServer
     Source SQL Server instance name.
@@ -89,31 +118,38 @@ function Invoke-SqlCpyServerConfigApply {
 
 .PARAMETER DryRun
     When $true, only log intended changes.
+
+.PARAMETER Config
+    Config hashtable (for connection security). When omitted, Get-SqlCpyConfig is called.
 #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)] [string]$SourceServer,
         [Parameter(Mandatory)] [string]$TargetServer,
-        [bool]$DryRun = $true
+        [bool]$DryRun = $true,
+        [hashtable]$Config
     )
+
+    if (-not $Config) { $Config = Get-SqlCpyConfig }
 
     Write-SqlCpyStep "Applying server configuration: $SourceServer -> $TargetServer (DryRun=$DryRun)"
 
-    $diff = Invoke-SqlCpyServerConfigCompare -SourceServer $SourceServer -TargetServer $TargetServer
+    $diff = Invoke-SqlCpyServerConfigCompare -SourceServer $SourceServer -TargetServer $TargetServer -Config $Config
 
     if (-not $diff) {
         Write-SqlCpyInfo 'No differences detected.'
         return
     }
 
+    $copySplat = Get-SqlCpyCopySplat -Config $Config -Source $SourceServer -Destination $TargetServer
+
     foreach ($d in $diff) {
         $msg = "{0}: {1} -> {2}" -f $d.Name, $d.TargetValue, $d.SourceValue
         if ($DryRun) {
             Write-SqlCpyInfo "DRYRUN would set $msg"
         } else {
-            # TODO: Validate exact parameter set on a live environment.
             Write-SqlCpyInfo "Applying $msg"
-            Copy-DbaSpConfigure -Source $SourceServer -Destination $TargetServer -ConfigName $d.Name -EnableException
+            Copy-DbaSpConfigure @copySplat -ConfigName $d.Name -EnableException
         }
     }
 }

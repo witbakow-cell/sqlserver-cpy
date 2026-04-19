@@ -11,6 +11,9 @@ function Invoke-SqlCpyLoginCopy {
     Honours the DryRun flag. With DryRun the function lists which logins would be
     copied but does not call Copy-DbaLogin.
 
+    Connection security parameters (EncryptConnection, TrustServerCertificate,
+    ConnectionTimeout) flow via Get-SqlCpyConnectionSplat / Get-SqlCpyCopySplat.
+
 .PARAMETER SourceServer
     Source SQL Server instance name.
 
@@ -23,6 +26,9 @@ function Invoke-SqlCpyLoginCopy {
 .PARAMETER DryRun
     When $true, only log intended copies.
 
+.PARAMETER Config
+    Config hashtable for connection security. When omitted, Get-SqlCpyConfig is called.
+
 .EXAMPLE
     Invoke-SqlCpyLoginCopy -SourceServer chbbbid2 -TargetServer localhost -DryRun $true
 #>
@@ -31,25 +37,29 @@ function Invoke-SqlCpyLoginCopy {
         [Parameter(Mandatory)] [string]$SourceServer,
         [Parameter(Mandatory)] [string]$TargetServer,
         [string[]]$LoginFilter,
-        [bool]$DryRun = $true
+        [bool]$DryRun = $true,
+        [hashtable]$Config
     )
+
+    if (-not $Config) { $Config = Get-SqlCpyConfig }
 
     Write-SqlCpyStep "Copying logins: $SourceServer -> $TargetServer (DryRun=$DryRun)"
 
-    # TODO: Validate on a live environment. The logins list path below is defensive -
-    # tune filters (sa, ##MS_*) based on target policy.
-    $logins = Get-DbaLogin -SqlInstance $SourceServer |
+    $srcSplat = Get-SqlCpyConnectionSplat -Config $Config -Server $SourceServer -Credential $Config.SourceCredential
+    $logins = Get-DbaLogin @srcSplat |
         Where-Object {
             $_.Name -notlike '##*' -and $_.Name -ne 'sa' -and
             ((-not $LoginFilter) -or ($LoginFilter -contains $_.Name))
         }
+
+    $copySplat = Get-SqlCpyCopySplat -Config $Config -Source $SourceServer -Destination $TargetServer
 
     foreach ($l in $logins) {
         if ($DryRun) {
             Write-SqlCpyInfo "DRYRUN would copy login: $($l.Name) [$($l.LoginType)]"
         } else {
             Write-SqlCpyInfo "Copying login: $($l.Name)"
-            Copy-DbaLogin -Source $SourceServer -Destination $TargetServer -Login $l.Name -EnableException
+            Copy-DbaLogin @copySplat -Login $l.Name -EnableException
         }
     }
 }

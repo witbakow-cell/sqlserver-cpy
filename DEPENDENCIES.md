@@ -51,3 +51,23 @@ includes a planned SSAS extension. They are **not used** by the current scaffold
   (e.g. `sysadmin` for server-level config compare/apply; `ssis_admin` or equivalent
   for SSISDB operations). The scaffold does not attempt to elevate or diagnose
   permission gaps; operations will fail with the provider's native error.
+
+## TLS / certificate trust
+
+Current `dbatools` releases wrap `Microsoft.Data.SqlClient` 4+, which defaults to
+`Encrypt=Mandatory` and validates the SQL Server's TLS certificate against the local
+trust store. Self-signed or internally issued certs raise:
+
+> "The certificate chain was issued by an authority that is not trusted"
+
+`sqlserver-cpy` exposes three config keys in `config/default.psd1` to control this:
+
+- `EncryptConnection` (default `$true`)
+- `TrustServerCertificate` (default `$true`; scaffold/admin convenience - see README for
+  the MITM tradeoff and production guidance)
+- `ConnectionTimeoutSeconds` (default `15`)
+
+These are forwarded to every `dbatools` cmdlet through the centralized helpers
+`Get-SqlCpyConnectionSplat` / `Get-SqlCpyCopySplat`. Use the TUI `Preflight` option or
+call `Test-SqlCpyPreflight` directly to validate both endpoints before running migration
+steps.

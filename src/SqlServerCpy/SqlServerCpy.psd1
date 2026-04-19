@@ -17,6 +17,12 @@
 
     FunctionsToExport = @(
         'Get-SqlCpyConfig'
+        'Get-SqlCpyRepoRoot'
+        'Get-SqlCpyConnectionSplat'
+        'Get-SqlCpyCopySplat'
+        'Get-SqlCpyDbaInstance'
+        'Get-SqlCpyConnectionErrorHint'
+        'Test-SqlCpyPreflight'
         'Write-SqlCpyStep'
         'Write-SqlCpyInfo'
         'Write-SqlCpyWarning'

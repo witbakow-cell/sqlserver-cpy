@@ -28,6 +28,67 @@ in this initial scaffold. See `docs/SSAS_PLANNED.md`.
 Override these through the interactive TUI or by editing `config/default.psd1`
 (or a copy, e.g. `config/local.psd1`, which is gitignored).
 
+## Connection security
+
+Recent SQL Server client stacks (Microsoft.Data.SqlClient 4+, used by current `dbatools`
+releases) default to `Encrypt=Mandatory` with strict certificate-chain validation. On a
+server that presents a self-signed or internally issued certificate this surfaces as:
+
+```
+WARNING: [HH:mm:ss][Get-DbaSpConfigure] Failure | The certificate chain was issued by
+an authority that is not trusted
+```
+
+followed by an empty result. `sqlserver-cpy` handles this centrally through three config
+keys in `config/default.psd1`:
+
+| Key                        | Default  | Meaning |
+|----------------------------|----------|---------|
+| `EncryptConnection`        | `$true`  | Request TLS on the TDS connection. |
+| `TrustServerCertificate`   | `$true`  | Skip CA/chain validation. **Scaffold/admin default.** |
+| `ConnectionTimeoutSeconds` | `15`     | Connection timeout passed to dbatools / SMO. |
+
+These flow into every `dbatools` cmdlet the tool calls through `Get-SqlCpyConnectionSplat`
+/ `Get-SqlCpyCopySplat`, so you only configure them once.
+
+### Security tradeoff
+
+`TrustServerCertificate = $true` is the default because this tool is intended for local
+admin-bootstrap migrations (typically Windows auth, LAN, self-signed cert on the SQL
+Server). It disables hostname / CA chain validation and is therefore **vulnerable to an
+active MITM attack on TDS traffic**. That is acceptable for a lab or one-off admin
+migration; it is **not acceptable for production over untrusted networks**.
+
+For production, flip it off in `config/local.psd1`:
+
+```powershell
+@{ TrustServerCertificate = $false }
+```
+
+and install a properly chained server certificate on the SQL Server instance. The
+preflight step will then give you an actionable error instead of a silent warning.
+
+### Configuring the default `chbbbid2 -> localhost` case
+
+In most scaffold sessions the two defaults are already what you want. To make it explicit,
+create `config/local.psd1` next to `config/default.psd1`:
+
+```powershell
+@{
+    SourceServer           = 'chbbbid2'
+    TargetServer           = 'localhost'
+    EncryptConnection      = $true
+    TrustServerCertificate = $true   # scaffold / admin convenience; see warning above
+    ConnectionTimeoutSeconds = 15
+}
+```
+
+Then run the TUI, pick option **9) Preflight** to confirm both servers are reachable
+with these settings, and only after that proceed to **1) Compare server configuration**.
+
+You can also adjust the same three values live from the TUI via option **8) Change
+connection security**.
+
 ## Dependency strategy
 
 The architecture decision for this project is **dbatools-first**. Use `dbatools` cmdlets

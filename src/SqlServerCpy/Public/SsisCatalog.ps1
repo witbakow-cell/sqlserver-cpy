@@ -14,7 +14,8 @@ function Invoke-SqlCpySsisCatalogCopy {
     the user via the TUI to create the catalog first (out of scope for this
     initial scaffold).
 
-    Honours the DryRun flag.
+    Honours the DryRun flag. Connection security parameters flow via
+    Get-SqlCpyCopySplat.
 
 .PARAMETER SourceServer
     Source SQL Server instance name.
@@ -28,6 +29,9 @@ function Invoke-SqlCpySsisCatalogCopy {
 .PARAMETER DryRun
     When $true, only log intended copies.
 
+.PARAMETER Config
+    Config hashtable for connection security. When omitted, Get-SqlCpyConfig is called.
+
 .NOTES
     Requires SSISDB to exist on both source and target. Environments are copied
     with references; sensitive values may require a project password on the
@@ -38,8 +42,11 @@ function Invoke-SqlCpySsisCatalogCopy {
         [Parameter(Mandatory)] [string]$SourceServer,
         [Parameter(Mandatory)] [string]$TargetServer,
         [string[]]$FolderFilter,
-        [bool]$DryRun = $true
+        [bool]$DryRun = $true,
+        [hashtable]$Config
     )
+
+    if (-not $Config) { $Config = Get-SqlCpyConfig }
 
     Write-SqlCpyStep "Copying SSIS catalog: $SourceServer -> $TargetServer (DryRun=$DryRun)"
 
@@ -51,11 +58,8 @@ function Invoke-SqlCpySsisCatalogCopy {
         return
     }
 
-    $params = @{
-        Source          = $SourceServer
-        Destination     = $TargetServer
-        EnableException = $true
-    }
+    $params = Get-SqlCpyCopySplat -Config $Config -Source $SourceServer -Destination $TargetServer
+    $params['EnableException'] = $true
     if ($FolderFilter) { $params['Folder'] = $FolderFilter }
 
     # TODO: Copy-DbaSsisCatalog behavior varies by dbatools version. Confirm parameter

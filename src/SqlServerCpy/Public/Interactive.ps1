@@ -4,9 +4,9 @@ function Start-SqlCpyInteractive {
     Starts the interactive menu-driven console flow (TUI) for sqlserver-cpy.
 
 .DESCRIPTION
-    Loads configuration, shows the current source/target/DryRun state, and presents
-    a menu of actions. Each action logs its progress to the screen via
-    Write-SqlCpyStep / Write-SqlCpyInfo.
+    Loads configuration, shows the current source/target/DryRun and connection-security
+    state, and presents a menu of actions. Each action logs its progress to the screen
+    via Write-SqlCpyStep / Write-SqlCpyInfo.
 
     Any uncaught exception from an action is caught at this level and rendered
     via Show-SqlCpyErrorScreen, which ends the run gracefully and offers to copy
@@ -37,6 +37,12 @@ function Start-SqlCpyInteractive {
         Write-Host ("  Source : {0}" -f $cfg.SourceServer)
         Write-Host ("  Target : {0}" -f $cfg.TargetServer)
         Write-Host ("  DryRun : {0}" -f $cfg.DryRun)
+        $trustColor = if ($cfg.TrustServerCertificate) { 'Yellow' } else { 'Gray' }
+        Write-Host ("  Encrypt: {0}   TrustServerCertificate: {1}   Timeout: {2}s" -f `
+            $cfg.EncryptConnection, $cfg.TrustServerCertificate, $cfg.ConnectionTimeoutSeconds) -ForegroundColor $trustColor
+        if ($cfg.TrustServerCertificate) {
+            Write-Host '  (TrustServerCertificate=True: scaffold/admin default; MITM risk over untrusted networks.)' -ForegroundColor DarkYellow
+        }
         Write-Host ''
         Write-Host '  1) Compare server configuration'
         Write-Host '  2) Apply (equalize) server configuration'
@@ -45,6 +51,8 @@ function Start-SqlCpyInteractive {
         Write-Host '  5) Copy SSIS catalog (folders, projects, environments)'
         Write-Host '  6) Copy selected databases (schema-only, no data)'
         Write-Host '  7) Change source / target / DryRun'
+        Write-Host '  8) Change connection security (Encrypt / TrustServerCertificate / Timeout)'
+        Write-Host '  9) Preflight: test connectivity to source and target'
         Write-Host '  0) Exit'
         Write-Host ''
 
@@ -53,38 +61,49 @@ function Start-SqlCpyInteractive {
         try {
             switch ($choice) {
                 '1' {
+                    if (-not (Test-SqlCpyPreflight -Config $cfg)) { continue }
                     $diff = Invoke-SqlCpyServerConfigCompare `
                         -SourceServer   $cfg.SourceServer `
                         -TargetServer   $cfg.TargetServer `
-                        -ExtendedChecks $cfg.ExtendedServerChecks
+                        -ExtendedChecks $cfg.ExtendedServerChecks `
+                        -Config         $cfg
                     if ($diff) { $diff | Format-Table -AutoSize } else { Write-SqlCpyInfo 'No differences.' }
                 }
                 '2' {
+                    if (-not (Test-SqlCpyPreflight -Config $cfg)) { continue }
                     Invoke-SqlCpyServerConfigApply `
                         -SourceServer $cfg.SourceServer `
                         -TargetServer $cfg.TargetServer `
-                        -DryRun       $cfg.DryRun
+                        -DryRun       $cfg.DryRun `
+                        -Config       $cfg
                 }
                 '3' {
+                    if (-not (Test-SqlCpyPreflight -Config $cfg)) { continue }
                     Invoke-SqlCpyLoginCopy `
                         -SourceServer $cfg.SourceServer `
                         -TargetServer $cfg.TargetServer `
-                        -DryRun       $cfg.DryRun
+                        -DryRun       $cfg.DryRun `
+                        -Config       $cfg
                 }
                 '4' {
+                    if (-not (Test-SqlCpyPreflight -Config $cfg)) { continue }
                     Invoke-SqlCpyAgentJobCopy `
                         -SourceServer $cfg.SourceServer `
                         -TargetServer $cfg.TargetServer `
-                        -DryRun       $cfg.DryRun
+                        -DryRun       $cfg.DryRun `
+                        -Config       $cfg
                 }
                 '5' {
+                    if (-not (Test-SqlCpyPreflight -Config $cfg)) { continue }
                     Invoke-SqlCpySsisCatalogCopy `
                         -SourceServer $cfg.SourceServer `
                         -TargetServer $cfg.TargetServer `
                         -FolderFilter $cfg.SsisFolders `
-                        -DryRun       $cfg.DryRun
+                        -DryRun       $cfg.DryRun `
+                        -Config       $cfg
                 }
                 '6' {
+                    if (-not (Test-SqlCpyPreflight -Config $cfg)) { continue }
                     $dbs = $cfg.SchemaOnlyDatabaseList
                     if (-not $dbs -or $dbs.Count -eq 0) {
                         $entered = Read-Host 'Databases (comma-separated)'
@@ -96,7 +115,8 @@ function Start-SqlCpyInteractive {
                         -SourceServer $cfg.SourceServer `
                         -TargetServer $cfg.TargetServer `
                         -Databases    $dbs `
-                        -DryRun       $cfg.DryRun
+                        -DryRun       $cfg.DryRun `
+                        -Config       $cfg
                 }
                 '7' {
                     $s = Read-Host ("Source [{0}]" -f $cfg.SourceServer)
@@ -106,6 +126,21 @@ function Start-SqlCpyInteractive {
                     $d = Read-Host ("DryRun [{0}] (y/n)" -f $cfg.DryRun)
                     if ($d -match '^(?i)y') { $cfg.DryRun = $true }
                     elseif ($d -match '^(?i)n') { $cfg.DryRun = $false }
+                }
+                '8' {
+                    $e = Read-Host ("EncryptConnection [{0}] (y/n)" -f $cfg.EncryptConnection)
+                    if ($e -match '^(?i)y') { $cfg.EncryptConnection = $true }
+                    elseif ($e -match '^(?i)n') { $cfg.EncryptConnection = $false }
+
+                    $tr = Read-Host ("TrustServerCertificate [{0}] (y/n)" -f $cfg.TrustServerCertificate)
+                    if ($tr -match '^(?i)y') { $cfg.TrustServerCertificate = $true }
+                    elseif ($tr -match '^(?i)n') { $cfg.TrustServerCertificate = $false }
+
+                    $to = Read-Host ("ConnectionTimeoutSeconds [{0}]" -f $cfg.ConnectionTimeoutSeconds)
+                    if ($to -match '^\d+$') { $cfg.ConnectionTimeoutSeconds = [int]$to }
+                }
+                '9' {
+                    [void](Test-SqlCpyPreflight -Config $cfg)
                 }
                 '0' { return }
                 default { Write-SqlCpyWarning "Unknown choice: $choice" }

@@ -12,8 +12,9 @@ function Invoke-SqlCpySchemaOnlyDatabaseCopy {
     for applying the generated script. SMO Scripter is the documented fallback when
     finer control over dependency ordering is needed.
 
-    Honours the DryRun flag. With DryRun, the function scripts into a temp folder
-    but does not execute the script on the target.
+    Connection security parameters flow via Get-SqlCpyConnectionSplat /
+    Get-SqlCpyDbaInstance. Honours the DryRun flag. With DryRun, the function scripts
+    into a temp folder but does not execute the script on the target.
 
 .PARAMETER SourceServer
     Source SQL Server instance name.
@@ -29,6 +30,9 @@ function Invoke-SqlCpySchemaOnlyDatabaseCopy {
 
 .PARAMETER OutputFolder
     Optional folder to store generated .sql files. Defaults to a temp path.
+
+.PARAMETER Config
+    Config hashtable for connection security. When omitted, Get-SqlCpyConfig is called.
 #>
     [CmdletBinding()]
     param(
@@ -36,8 +40,11 @@ function Invoke-SqlCpySchemaOnlyDatabaseCopy {
         [Parameter(Mandatory)] [string]$TargetServer,
         [Parameter(Mandatory)] [string[]]$Databases,
         [bool]$DryRun = $true,
-        [string]$OutputFolder
+        [string]$OutputFolder,
+        [hashtable]$Config
     )
+
+    if (-not $Config) { $Config = Get-SqlCpyConfig }
 
     Write-SqlCpyStep "Copying databases (schema-only): $SourceServer -> $TargetServer (DryRun=$DryRun)"
 
@@ -54,14 +61,12 @@ function Invoke-SqlCpySchemaOnlyDatabaseCopy {
 
         $scriptPath = Join-Path -Path $OutputFolder -ChildPath ("{0}.sql" -f $db)
 
-        # TODO: Validate on a live environment. Export-DbaScript via piped objects
-        # from Get-DbaDbObject is one approach; another is SMO's Scripter with
-        # DriWithNoCheck, ScriptData=$false.
         try {
-            $src = Connect-DbaInstance -SqlInstance $SourceServer -Database $db -ErrorAction Stop
-            Export-DbaScript -InputObject $src.Databases[$db] -FilePath $scriptPath -ScriptingOptionsObject (New-DbaScriptingOption)
+            $srcConn = Get-SqlCpyDbaInstance -Config $Config -Server $SourceServer -Credential $Config.SourceCredential
+            Export-DbaScript -InputObject $srcConn.Databases[$db] -FilePath $scriptPath -ScriptingOptionsObject (New-DbaScriptingOption)
         } catch {
             Write-SqlCpyWarning "Scripting for $db used fallback path: $($_.Exception.Message)"
+            Write-SqlCpyInfo   (Get-SqlCpyConnectionErrorHint -Message $_.Exception.Message -Config $Config)
             # TODO: Fallback to SMO Scripter if Export-DbaScript pipeline above is not
             # appropriate for the installed dbatools version.
         }
@@ -71,9 +76,8 @@ function Invoke-SqlCpySchemaOnlyDatabaseCopy {
             continue
         }
 
-        # TODO: Apply script to target. Must ensure target database exists first,
-        # optionally drop-and-recreate if a flag is added. Minimal behavior:
         Write-SqlCpyInfo "Applying script to target: $db"
-        Invoke-DbaQuery -SqlInstance $TargetServer -Database $db -File $scriptPath -EnableException
+        $tgtSplat = Get-SqlCpyConnectionSplat -Config $Config -Server $TargetServer -Credential $Config.TargetCredential
+        Invoke-DbaQuery @tgtSplat -Database $db -File $scriptPath -EnableException
     }
 }

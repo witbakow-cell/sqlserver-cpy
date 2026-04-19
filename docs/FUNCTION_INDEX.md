@@ -9,9 +9,30 @@ read the help block.
 
 - **`Get-SqlCpyConfig`** (`src/SqlServerCpy/Public/Config.ps1`)
   — Loads `config/default.psd1` and merges any `config/local.psd1` on top. Returns a
-  hashtable containing at least `SourceServer`, `TargetServer`, `DryRun`, `Areas`.
+  hashtable containing at least `SourceServer`, `TargetServer`, `DryRun`, `Areas`,
+  `EncryptConnection`, `TrustServerCertificate`, `ConnectionTimeoutSeconds`.
 - **`Get-SqlCpyRepoRoot`** (`src/SqlServerCpy/Public/Config.ps1`)
   — Returns the repository root, inferred from the module's location.
+
+## Connection / preflight
+
+- **`Get-SqlCpyConnectionSplat`** (`src/SqlServerCpy/Public/Connection.ps1`)
+  — Builds a hashtable with `SqlInstance`, `EncryptConnection`, `TrustServerCertificate`,
+  `ConnectionTimeout`, `SqlCredential` for splatting onto `dbatools` cmdlets that take
+  `-SqlInstance` (e.g. `Get-DbaSpConfigure`, `Get-DbaLogin`, `Invoke-DbaQuery`).
+- **`Get-SqlCpyCopySplat`** (`src/SqlServerCpy/Public/Connection.ps1`)
+  — Same idea for `Copy-Dba*` cmdlets that take `-Source` / `-Destination`
+  (`Copy-DbaLogin`, `Copy-DbaAgentJob`, `Copy-DbaSsisCatalog`, `Copy-DbaSpConfigure`).
+- **`Get-SqlCpyDbaInstance`** (`src/SqlServerCpy/Public/Connection.ps1`)
+  — Opens a `Connect-DbaInstance` SMO handle honouring the connection-security config.
+  Use this when a downstream cmdlet does not expose `-EncryptConnection` /
+  `-TrustServerCertificate`.
+- **`Test-SqlCpyPreflight`** (`src/SqlServerCpy/Public/Connection.ps1`)
+  — Validates source and target connectivity under the configured TLS settings and
+  prints actionable diagnostics for untrusted certificate chains, auth failures,
+  network failures, and missing `dbatools`. Returns `$true`/`$false`.
+- **`Get-SqlCpyConnectionErrorHint`** (`src/SqlServerCpy/Public/Connection.ps1`)
+  — Maps a SQL connection error message to a one-line remediation hint.
 
 ## Logging / UI
 

@@ -41,6 +41,49 @@ Decisions
 6. SSAS is a documented planned extension only.
    - Not implemented in this scaffold. See docs/SSAS_PLANNED.md.
 
+7. Connection security is centralized, not per-call.
+   - Three config keys drive every dbatools call:
+       EncryptConnection        (default $true)
+       TrustServerCertificate   (default $true)
+       ConnectionTimeoutSeconds (default 15)
+   - Public migration functions never build connection arguments inline.
+     They call Get-SqlCpyConnectionSplat (for cmdlets that take -SqlInstance)
+     or Get-SqlCpyCopySplat (for Copy-Dba* cmdlets that take -Source /
+     -Destination) and splat the result. Functions that need an actual
+     connected SMO handle - e.g. Export-DbaScript against a specific
+     database - use Get-SqlCpyDbaInstance, which wraps Connect-DbaInstance
+     with the same settings.
+   - TrustServerCertificate default is $true because this tool is for
+     local admin-bootstrap migrations (Windows auth, LAN, self-signed
+     server cert). That disables CA/hostname validation and is therefore
+     MITM-unsafe over untrusted networks. README calls this out; users
+     targeting production are expected to flip it off in config/local.psd1
+     and install a properly chained cert on the server.
+
+8. Preflight before migration steps.
+   - Test-SqlCpyPreflight runs Connect-DbaInstance against both source
+     and target under the configured TLS settings and reports actionable
+     hints for: missing dbatools, untrusted certificate chain, auth
+     failure, network / host unreachable.
+   - The TUI invokes preflight before every migration action (options
+     1-6). This replaces the silent WARN + empty result we previously
+     saw from Get-DbaSpConfigure when the certificate was not trusted;
+     the user now gets either a clean "Preflight OK" line or a concrete
+     error with a next-step hint.
+
+Observed issue resolved
+-----------------------
+
+- WARNING: [Get-DbaSpConfigure] Failure | The certificate chain was
+  issued by an authority that is not trusted
+  Root cause: dbatools -> Microsoft.Data.SqlClient 4.x defaults to
+  Encrypt=Mandatory with strict chain validation. The server (chbbbid2
+  in the default config) presents a self-signed cert that is not in
+  the caller's trust store. Fix shipped here: the centralized splat
+  passes TrustServerCertificate=True by default, and Preflight surfaces
+  a clear diagnostic if the user has flipped it off and the handshake
+  still fails.
+
 Observations
 ------------
 

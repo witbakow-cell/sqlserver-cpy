@@ -8,7 +8,8 @@ function Invoke-SqlCpyAgentJobCopy {
     schedules, operators, and categories via the related cmdlets when -Force or
     explicit parameters are used.
 
-    Honours the DryRun flag.
+    Honours the DryRun flag. Connection security parameters flow via
+    Get-SqlCpyConnectionSplat / Get-SqlCpyCopySplat.
 
 .PARAMETER SourceServer
     Source SQL Server instance name.
@@ -21,28 +22,35 @@ function Invoke-SqlCpyAgentJobCopy {
 
 .PARAMETER DryRun
     When $true, only log intended copies.
+
+.PARAMETER Config
+    Config hashtable for connection security. When omitted, Get-SqlCpyConfig is called.
 #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)] [string]$SourceServer,
         [Parameter(Mandatory)] [string]$TargetServer,
         [string[]]$JobFilter,
-        [bool]$DryRun = $true
+        [bool]$DryRun = $true,
+        [hashtable]$Config
     )
+
+    if (-not $Config) { $Config = Get-SqlCpyConfig }
 
     Write-SqlCpyStep "Copying SQL Agent jobs: $SourceServer -> $TargetServer (DryRun=$DryRun)"
 
-    # TODO: Validate on a live environment. Consider copying Operators / Schedules /
-    # Categories first via Copy-DbaAgentOperator, Copy-DbaAgentSchedule, etc.
-    $jobs = Get-DbaAgentJob -SqlInstance $SourceServer |
+    $srcSplat = Get-SqlCpyConnectionSplat -Config $Config -Server $SourceServer -Credential $Config.SourceCredential
+    $jobs = Get-DbaAgentJob @srcSplat |
         Where-Object { (-not $JobFilter) -or ($JobFilter -contains $_.Name) }
+
+    $copySplat = Get-SqlCpyCopySplat -Config $Config -Source $SourceServer -Destination $TargetServer
 
     foreach ($j in $jobs) {
         if ($DryRun) {
             Write-SqlCpyInfo "DRYRUN would copy job: $($j.Name) [Enabled=$($j.IsEnabled)]"
         } else {
             Write-SqlCpyInfo "Copying job: $($j.Name)"
-            Copy-DbaAgentJob -Source $SourceServer -Destination $TargetServer -Job $j.Name -EnableException
+            Copy-DbaAgentJob @copySplat -Job $j.Name -EnableException
         }
     }
 }
