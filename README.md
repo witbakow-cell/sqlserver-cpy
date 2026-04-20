@@ -451,7 +451,11 @@ Key differences from the schema-only copy:
      NOT the filename stem or the backup header's embedded name.
 4. If no matching backup exists, the tool emits
    `WARN backup not found for database <X> in path <Y>; skipping` and moves on -
-   a missing backup is **not** fatal.
+   a missing backup is **not** fatal. When the folder is non-empty, a
+   follow-up `WARN` surfaces the closest plausible filename so typos or
+   missing aliases are visible from the log
+   (e.g. a request for `timesheet` will suggest `mTimesheet 20260420 0633.bak`
+   and point at `DatabaseRestoreNameAliases`).
 5. In `DryRun = $true` the tool logs what it would have restored without
    touching the target, e.g.
    `INFO DRYRUN would restore mPurchasing from \\chbbopa2\CHBBBID2-backup$\FULL\mPurchasing 20260420 0633.bak as mPurchasing (2026-04-20 06:33:00)`.
@@ -468,7 +472,59 @@ DatabaseRestoreNoRecovery        = $false
 DatabaseRestoreTimeoutSeconds    = 0                    # 0 = no timeout
 DatabaseRestoreDataFileDirectory = $null                # $null -> target default
 DatabaseRestoreLogFileDirectory  = $null                # $null -> target default
+DatabaseRestoreLogCandidateLimit = 50                   # cap of preview lines when enumerating
+DatabaseRestoreNameAliases       = @{}                  # e.g. @{ timesheet = 'mTimesheet' }
 ```
+
+### Strict matching and aliases
+
+The matcher is deliberately strict: a request for `timesheet` will **not**
+match a file named `mTimesheet 20260420 0633.bak`, because a bare substring
+match would also pull `timesheet2.bak` or `mTimesheet_dev.bak` into the
+candidate list. The allowed stem shapes are exactly the ones listed above
+(`<db>`, `<db>_…`, `<db>-…`, `<db>.…`, `<db> yyyyMMdd HHmm`).
+
+If the logical database name you want to type does not match the on-share
+base name, declare that once in `DatabaseRestoreNameAliases` rather than
+renaming files or loosening the matcher. Keys are compared
+case-insensitively:
+
+```powershell
+DatabaseRestoreNameAliases = @{
+    timesheet  = 'mTimesheet'
+    purchasing = 'mPurchasing'
+}
+```
+
+With the alias in place, running the restore action for `timesheet` will
+match files whose stem starts with `mTimesheet`. The restored database on
+the target still uses the **requested** name (e.g. `timesheet`), not the
+alias target — the alias only controls file matching on the share.
+
+### Diagnostics on restore runs
+
+The restore action writes a thick, self-describing log so that a failed
+match can be diagnosed from the log alone:
+
+- the raw backup path string and its length, so any PowerShell escaping of
+  `$` or backslashes is visible;
+- the result of `Test-Path` against that path (UNC reachability);
+- the total file count in the folder and a capped preview of filenames
+  with extension / `LastWriteTime` / `Length` (cap via
+  `DatabaseRestoreLogCandidateLimit`, default 50; set `0` for no cap);
+- for each requested database, every candidate and either its match
+  reason (`exact-stem`, `prefix-underscore`, `prefix-dash`, `prefix-dot`,
+  `stamped`) or its discard reason (`ext-excluded`, `pattern-excluded`,
+  `prefix-bleed`, `stamped-bad-format`, `stem-shorter-than-db`,
+  `stem-mismatch`);
+- when no candidate matched but the folder is non-empty, a targeted
+  `WARN` naming the closest plausible file — e.g.
+  `No exact/stamped match for 'timesheet' … Closest candidate appears to
+  be 'mTimesheet 20260420 0633.bak'. Matching is strict - configure
+  DatabaseRestoreNameAliases …`;
+- when the folder is unreachable or empty, a hint about hidden-share
+  permissions (`$` in the share name is valid in the path string; the
+  host account needs read access to the hidden share).
 
 ### Caveats
 

@@ -1093,6 +1093,8 @@ try {
         'DatabaseRestoreTimeoutSeconds'
         'DatabaseRestoreDataFileDirectory'
         'DatabaseRestoreLogFileDirectory'
+        'DatabaseRestoreLogCandidateLimit'
+        'DatabaseRestoreNameAliases'
     )
     foreach ($k in $restoreKeys) {
         if (-not $cfgForRestore.ContainsKey($k)) {
@@ -1131,6 +1133,9 @@ try {
             'Get-SqlCpyDatabaseRestoreConfig'
             'Find-SqlCpyDatabaseBackupFile'
             'Test-SqlCpyRestoreFileMatchesDatabase'
+            'Get-SqlCpyRestoreMatchReason'
+            'Get-SqlCpyRestoreClosestCandidate'
+            'Resolve-SqlCpyRestoreDatabaseAlias'
         )
         foreach ($fn in $restoreExports) {
             if ($manifest.FunctionsToExport -notcontains $fn) {
@@ -1482,6 +1487,224 @@ try {
 } catch {
     $failures += [pscustomobject]@{
         File   = 'DatabaseRestore stamped-layout tests'
+        Errors = $_.Exception.Message
+    }
+}
+
+Write-Host ''
+Write-Host 'Checking DatabaseRestore diagnostic helpers and alias support...' -ForegroundColor Cyan
+try {
+    $restoreFile = Join-Path -Path $repoRoot -ChildPath 'src/SqlServerCpy/Public/DatabaseRestore.ps1'
+
+    # Get-SqlCpyRestoreMatchReason: match cases return the expected reason.
+    $reasonPositive = @(
+        @{ File = 'mPurchasing.bak';                Db = 'mPurchasing'; Expected = 'exact-stem'        }
+        @{ File = 'mPurchasing_FULL_20240101.bak';  Db = 'mPurchasing'; Expected = 'prefix-underscore' }
+        @{ File = 'mPurchasing-2024-01-01.bak';     Db = 'mPurchasing'; Expected = 'prefix-dash'       }
+        @{ File = 'mPurchasing.2024.bak';           Db = 'mPurchasing'; Expected = 'prefix-dot'        }
+        @{ File = 'mPurchasing 20260420 0633.bak';  Db = 'mPurchasing'; Expected = 'stamped'           }
+    )
+    foreach ($c in $reasonPositive) {
+        $got = Get-SqlCpyRestoreMatchReason -FileName $c.File -Database $c.Db
+        if (-not $got.Match -or $got.Reason -ne $c.Expected) {
+            $failures += [pscustomobject]@{
+                File   = $restoreFile
+                Errors = "Match reason for '$($c.File)' vs '$($c.Db)' should be Match=true/Reason=$($c.Expected); got Match=$($got.Match)/Reason=$($got.Reason)"
+            }
+        } else {
+            Write-Host ("  OK  match reason '{0}' ~ '{1}' -> {2}" -f $c.File, $c.Db, $got.Reason)
+        }
+    }
+
+    # Get-SqlCpyRestoreMatchReason: discard cases return the expected reason.
+    $reasonNegative = @(
+        @{ File = 'mTimesheet 20260420 0633.bak';  Db = 'timesheet';    Expected = 'stem-mismatch'       }
+        @{ File = 'mPurchasing2.bak';              Db = 'mPurchasing';  Expected = 'prefix-bleed'        }
+        @{ File = 'mPurchasing2 20260420 0633.bak';Db = 'mPurchasing';  Expected = 'prefix-bleed'        }
+        @{ File = 'mPurchasing 2026.bak';          Db = 'mPurchasing';  Expected = 'stamped-bad-format'  }
+        @{ File = 'tiny.bak';                      Db = 'mPurchasing';  Expected = 'stem-shorter-than-db' }
+    )
+    foreach ($c in $reasonNegative) {
+        $got = Get-SqlCpyRestoreMatchReason -FileName $c.File -Database $c.Db
+        if ($got.Match -or $got.Reason -ne $c.Expected) {
+            $failures += [pscustomobject]@{
+                File   = $restoreFile
+                Errors = "Match reason for '$($c.File)' vs '$($c.Db)' should be Match=false/Reason=$($c.Expected); got Match=$($got.Match)/Reason=$($got.Reason)"
+            }
+        } else {
+            Write-Host ("  OK  discard reason '{0}' !~ '{1}' -> {2}" -f $c.File, $c.Db, $got.Reason)
+        }
+    }
+
+    # Resolve-SqlCpyRestoreDatabaseAlias: no aliases, empty hashtable, and
+    # configured mapping.
+    $aliases = @{ 'timesheet' = 'mTimesheet'; 'PURCHASING' = 'mPurchasing' }
+    if ((Resolve-SqlCpyRestoreDatabaseAlias -Database 'timesheet' -Aliases $aliases) -ne 'mTimesheet') {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "Resolve-SqlCpyRestoreDatabaseAlias should map 'timesheet' to 'mTimesheet'"
+        }
+    } else {
+        Write-Host "  OK  alias maps 'timesheet' -> 'mTimesheet'"
+    }
+    if ((Resolve-SqlCpyRestoreDatabaseAlias -Database 'Purchasing' -Aliases $aliases) -ne 'mPurchasing') {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "Resolve-SqlCpyRestoreDatabaseAlias must match keys case-insensitively"
+        }
+    } else {
+        Write-Host "  OK  alias lookup is case-insensitive"
+    }
+    if ((Resolve-SqlCpyRestoreDatabaseAlias -Database 'dwcontrol' -Aliases $aliases) -ne 'dwcontrol') {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "Resolve-SqlCpyRestoreDatabaseAlias must pass unaliased names through unchanged"
+        }
+    } else {
+        Write-Host "  OK  alias passes unaliased names through unchanged"
+    }
+    if ((Resolve-SqlCpyRestoreDatabaseAlias -Database 'anything' -Aliases $null) -ne 'anything') {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "Resolve-SqlCpyRestoreDatabaseAlias with null Aliases must return input"
+        }
+    } else {
+        Write-Host "  OK  alias with null hashtable returns input"
+    }
+
+    # Get-SqlCpyDatabaseRestoreConfig surfaces the new LogCandidateLimit and
+    # NameAliases keys from Config.
+    $cfgWithDiag = @{
+        DatabaseRestoreLogCandidateLimit = 7
+        DatabaseRestoreNameAliases       = @{ timesheet = 'mTimesheet' }
+    }
+    $rcDiag = Get-SqlCpyDatabaseRestoreConfig -Config $cfgWithDiag
+    if ($rcDiag.LogCandidateLimit -ne 7) {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "Get-SqlCpyDatabaseRestoreConfig must thread DatabaseRestoreLogCandidateLimit into resolved config (got $($rcDiag.LogCandidateLimit))"
+        }
+    } else {
+        Write-Host "  OK  Get-SqlCpyDatabaseRestoreConfig threads LogCandidateLimit"
+    }
+    if (-not $rcDiag.NameAliases -or $rcDiag.NameAliases['timesheet'] -ne 'mTimesheet') {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "Get-SqlCpyDatabaseRestoreConfig must thread DatabaseRestoreNameAliases into resolved config"
+        }
+    } else {
+        Write-Host "  OK  Get-SqlCpyDatabaseRestoreConfig threads NameAliases"
+    }
+    $rcDefault = Get-SqlCpyDatabaseRestoreConfig -Config $null
+    if ($rcDefault.LogCandidateLimit -ne 50) {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "Get-SqlCpyDatabaseRestoreConfig default LogCandidateLimit should be 50; got $($rcDefault.LogCandidateLimit)"
+        }
+    } else {
+        Write-Host "  OK  LogCandidateLimit default = 50"
+    }
+    if ($null -eq $rcDefault.NameAliases -or $rcDefault.NameAliases.Count -ne 0) {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "Get-SqlCpyDatabaseRestoreConfig default NameAliases should be an empty hashtable"
+        }
+    } else {
+        Write-Host "  OK  NameAliases default = empty hashtable"
+    }
+
+    # Get-SqlCpyRestoreClosestCandidate: the documented scenario - asking for
+    # 'timesheet' when the share holds 'mTimesheet 20260420 0633.bak' should
+    # surface the mTimesheet file as the closest guess.
+    $mkClose = {
+        param($n)
+        [pscustomobject]@{ Name = $n; FullName = "\\share\FULL\$n" }
+    }
+    $closeSet = @(
+        & $mkClose 'mPurchasing 20260420 0633.bak'
+        & $mkClose 'mTimesheet 20260420 0633.bak'
+        & $mkClose 'DwControl 20260420 0633.bak'
+    )
+    $closest = Get-SqlCpyRestoreClosestCandidate -Database 'timesheet' -CandidateFiles $closeSet
+    if (-not $closest -or $closest.Name -ne 'mTimesheet 20260420 0633.bak') {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "Get-SqlCpyRestoreClosestCandidate should surface 'mTimesheet 20260420 0633.bak' for request 'timesheet'; got '$($closest.Name)'"
+        }
+    } else {
+        Write-Host "  OK  closest candidate for 'timesheet' is the mTimesheet file"
+    }
+    # When nothing plausibly matches, return $null (defensive: no false hints).
+    $closestNone = Get-SqlCpyRestoreClosestCandidate -Database 'zzzzzzz' -CandidateFiles $closeSet
+    if ($null -ne $closestNone) {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "Get-SqlCpyRestoreClosestCandidate should return `$null when no candidate shares a prefix; got '$($closestNone.Name)'"
+        }
+    } else {
+        Write-Host "  OK  closest candidate returns `$null when nothing plausibly matches"
+    }
+
+    # Source-level assertions: diagnostic log lines the user asked for must
+    # actually be emitted by Invoke-SqlCpyDatabaseRestore. We inspect the
+    # function source rather than running it (no SQL Server here).
+    $restoreText = Get-Content -LiteralPath $restoreFile -Raw
+    $expectedLogSnippets = @(
+        'Backup path \(raw\):'
+        'Backup path Test-Path:'
+        'Folder enumeration:'
+        'Folder contents \(showing'
+        'discard ''\{0\}'': '
+        'candidate ''\{0\}'': MATCH'
+        'No exact/stamped match for'
+        'DatabaseRestoreNameAliases'
+    )
+    foreach ($snip in $expectedLogSnippets) {
+        if ($restoreText -notmatch $snip) {
+            $failures += [pscustomobject]@{
+                File   = $restoreFile
+                Errors = "Invoke-SqlCpyDatabaseRestore source must emit diagnostic snippet matching /$snip/"
+            }
+        } else {
+            Write-Host ("  OK  diagnostic log snippet present: /{0}/" -f $snip)
+        }
+    }
+
+    # Strict matching must NOT be silently loosened. The matcher file must
+    # still contain the prefix-bleed guard so a future edit that removes the
+    # stricture fails this test.
+    if ($restoreText -notmatch "prefix-bleed") {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "prefix-bleed reason code missing; strict matching must not be silently loosened."
+        }
+    } else {
+        Write-Host "  OK  strict matcher retains prefix-bleed reason"
+    }
+
+    # default.psd1 must document the two new keys so local.psd1 authors can
+    # discover them without reading code.
+    $defaultPsd1 = Join-Path -Path $repoRoot -ChildPath 'config/default.psd1'
+    $defaultText = Get-Content -LiteralPath $defaultPsd1 -Raw
+    if ($defaultText -notmatch 'DatabaseRestoreLogCandidateLimit') {
+        $failures += [pscustomobject]@{
+            File   = $defaultPsd1
+            Errors = "config/default.psd1 must declare DatabaseRestoreLogCandidateLimit"
+        }
+    } else {
+        Write-Host "  OK  default config declares DatabaseRestoreLogCandidateLimit"
+    }
+    if ($defaultText -notmatch 'DatabaseRestoreNameAliases') {
+        $failures += [pscustomobject]@{
+            File   = $defaultPsd1
+            Errors = "config/default.psd1 must declare DatabaseRestoreNameAliases"
+        }
+    } else {
+        Write-Host "  OK  default config declares DatabaseRestoreNameAliases"
+    }
+} catch {
+    $failures += [pscustomobject]@{
+        File   = 'DatabaseRestore diagnostics tests'
         Errors = $_.Exception.Message
     }
 }

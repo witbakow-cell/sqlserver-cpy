@@ -15,7 +15,7 @@ function Get-SqlCpyDatabaseRestoreConfig {
 .OUTPUTS
     Hashtable with keys: BackupPath, FileExtensions, FilePattern,
     WithReplace, NoRecovery, TimeoutSeconds, DataFileDirectory,
-    LogFileDirectory.
+    LogFileDirectory, LogCandidateLimit, NameAliases.
 #>
     [CmdletBinding()]
     [OutputType([hashtable])]
@@ -24,14 +24,16 @@ function Get-SqlCpyDatabaseRestoreConfig {
     )
 
     $resolved = @{
-        BackupPath        = '\\chbbopa2\CHBBBID2-backup$\FULL'
-        FileExtensions    = @('.bak', '.backup')
-        FilePattern       = $null
-        WithReplace       = $true
-        NoRecovery        = $false
-        TimeoutSeconds    = 0
-        DataFileDirectory = $null
-        LogFileDirectory  = $null
+        BackupPath         = '\\chbbopa2\CHBBBID2-backup$\FULL'
+        FileExtensions     = @('.bak', '.backup')
+        FilePattern        = $null
+        WithReplace        = $true
+        NoRecovery         = $false
+        TimeoutSeconds     = 0
+        DataFileDirectory  = $null
+        LogFileDirectory   = $null
+        LogCandidateLimit  = 50
+        NameAliases        = @{}
     }
 
     if ($Config) {
@@ -59,6 +61,20 @@ function Get-SqlCpyDatabaseRestoreConfig {
         if ($Config.ContainsKey('DatabaseRestoreLogFileDirectory')) {
             $resolved.LogFileDirectory = $Config.DatabaseRestoreLogFileDirectory
         }
+        if ($Config.ContainsKey('DatabaseRestoreLogCandidateLimit')) {
+            $raw = $Config.DatabaseRestoreLogCandidateLimit
+            if ($null -ne $raw) { $resolved.LogCandidateLimit = [int]$raw }
+        }
+        if ($Config.ContainsKey('DatabaseRestoreNameAliases') -and $Config.DatabaseRestoreNameAliases) {
+            $aliasHash = @{}
+            foreach ($k in @($Config.DatabaseRestoreNameAliases.Keys)) {
+                if ([string]::IsNullOrWhiteSpace([string]$k)) { continue }
+                $v = [string]$Config.DatabaseRestoreNameAliases[$k]
+                if ([string]::IsNullOrWhiteSpace($v)) { continue }
+                $aliasHash[([string]$k).Trim()] = $v.Trim()
+            }
+            $resolved.NameAliases = $aliasHash
+        }
     }
 
     # Normalize extensions: always leading dot, lowercase.
@@ -72,6 +88,54 @@ function Get-SqlCpyDatabaseRestoreConfig {
     $resolved.FileExtensions = $normExt
 
     return $resolved
+}
+
+function Resolve-SqlCpyRestoreDatabaseAlias {
+<#
+.SYNOPSIS
+    Resolves a user-supplied database name to its on-share backup base name
+    via the optional DatabaseRestoreNameAliases mapping.
+
+.DESCRIPTION
+    Pure string helper. When the alias hashtable contains a case-insensitive
+    entry for the requested database, returns the aliased name; otherwise
+    returns the input unchanged. Whitespace is trimmed.
+
+    Aliases exist because the matcher is intentionally strict: a request
+    for "timesheet" will NOT match a file named "mTimesheet 20260420 0633.bak".
+    If the real backup base name differs from the logical database name in
+    the user's workflow, the alias map lets the user declare the mapping
+    once in config instead of renaming files or loosening the matcher.
+
+.PARAMETER Database
+    The user-supplied database name.
+
+.PARAMETER Aliases
+    Hashtable of { requestedName -> on-share base name }. May be $null or
+    empty.
+
+.OUTPUTS
+    [string] - the resolved on-share base name. Same as input when no alias
+    applies.
+#>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)] [AllowEmptyString()] [string]$Database,
+        [AllowNull()] [hashtable]$Aliases
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Database)) { return $Database }
+    $trimmed = $Database.Trim()
+    if (-not $Aliases -or $Aliases.Count -eq 0) { return $trimmed }
+
+    foreach ($k in @($Aliases.Keys)) {
+        if ([string]::Equals([string]$k, $trimmed, [StringComparison]::OrdinalIgnoreCase)) {
+            $v = [string]$Aliases[$k]
+            if (-not [string]::IsNullOrWhiteSpace($v)) { return $v.Trim() }
+        }
+    }
+    return $trimmed
 }
 
 function Test-SqlCpyRestoreFileMatchesDatabase {
@@ -111,29 +175,189 @@ function Test-SqlCpyRestoreFileMatchesDatabase {
         [Parameter(Mandatory)] [AllowEmptyString()] [string]$Database
     )
 
-    if ([string]::IsNullOrWhiteSpace($FileName)) { return $false }
-    if ([string]::IsNullOrWhiteSpace($Database)) { return $false }
+    $r = Get-SqlCpyRestoreMatchReason -FileName $FileName -Database $Database
+    return [bool]$r.Match
+}
+
+function Get-SqlCpyRestoreMatchReason {
+<#
+.SYNOPSIS
+    Returns a structured explanation of why a backup filename matched, or
+    did not match, a given database name.
+
+.DESCRIPTION
+    Pure string helper used by diagnostic logging. Unlike
+    Test-SqlCpyRestoreFileMatchesDatabase (boolean), this function exposes
+    the *reason* in a stable set of short codes so the action function can
+    log which candidate was discarded and why.
+
+    Reason codes:
+      empty-filename         filename was null/whitespace
+      empty-database         database was null/whitespace
+      no-stem                filename had no stem
+      exact-stem             stem equals db (match)
+      prefix-underscore      stem starts with "<db>_" (match)
+      prefix-dash            stem starts with "<db>-" (match)
+      prefix-dot             stem starts with "<db>." (match)
+      stamped                stem is "<db> yyyyMMdd HHmm" (match)
+      prefix-bleed           stem starts with db but next char is not a known separator
+      stamped-bad-format     stem starts with "<db> " but the rest is not yyyyMMdd HHmm
+      stem-shorter-than-db   stem is shorter than db, so cannot match
+      stem-mismatch          no common prefix with db
+
+.PARAMETER FileName
+    Filename only (not full path).
+
+.PARAMETER Database
+    Database name.
+
+.OUTPUTS
+    pscustomobject with properties: Match (bool), Reason (string),
+    FileName, Database, Stem.
+#>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)] [AllowEmptyString()] [string]$FileName,
+        [Parameter(Mandatory)] [AllowEmptyString()] [string]$Database
+    )
+
+    $out = [pscustomobject]@{
+        Match    = $false
+        Reason   = 'stem-mismatch'
+        FileName = $FileName
+        Database = $Database
+        Stem     = $null
+    }
+
+    if ([string]::IsNullOrWhiteSpace($FileName)) {
+        $out.Reason = 'empty-filename'
+        return $out
+    }
+    if ([string]::IsNullOrWhiteSpace($Database)) {
+        $out.Reason = 'empty-database'
+        return $out
+    }
 
     $stem = [System.IO.Path]::GetFileNameWithoutExtension($FileName)
-    if ([string]::IsNullOrEmpty($stem)) { return $false }
+    $out.Stem = $stem
+    if ([string]::IsNullOrEmpty($stem)) {
+        $out.Reason = 'no-stem'
+        return $out
+    }
 
     $db = $Database.Trim()
-    if ([string]::Equals($stem, $db, [StringComparison]::OrdinalIgnoreCase)) { return $true }
 
-    if ($stem.Length -gt $db.Length) {
-        $prefix = $stem.Substring(0, $db.Length)
-        if ([string]::Equals($prefix, $db, [StringComparison]::OrdinalIgnoreCase)) {
-            $sep = $stem[$db.Length]
-            if ($sep -eq '_' -or $sep -eq '-' -or $sep -eq '.') { return $true }
-            # Timestamped layout: "<db> <yyyyMMdd> <HHmm>"
-            if ($sep -eq ' ') {
-                $rest = $stem.Substring($db.Length + 1)
-                if ($rest -match '^\d{8}\s+\d{4}$') { return $true }
+    if ([string]::Equals($stem, $db, [StringComparison]::OrdinalIgnoreCase)) {
+        $out.Match = $true
+        $out.Reason = 'exact-stem'
+        return $out
+    }
+
+    if ($stem.Length -lt $db.Length) {
+        $out.Reason = 'stem-shorter-than-db'
+        return $out
+    }
+    if ($stem.Length -eq $db.Length) {
+        # Same length but exact-stem did not match, so the stems simply
+        # differ. Route through stem-mismatch rather than inventing a new
+        # reason code for this narrow case.
+        $out.Reason = 'stem-mismatch'
+        return $out
+    }
+
+    $prefix = $stem.Substring(0, $db.Length)
+    if (-not [string]::Equals($prefix, $db, [StringComparison]::OrdinalIgnoreCase)) {
+        $out.Reason = 'stem-mismatch'
+        return $out
+    }
+
+    $sep = $stem[$db.Length]
+    switch ($sep) {
+        '_' { $out.Match = $true; $out.Reason = 'prefix-underscore'; return $out }
+        '-' { $out.Match = $true; $out.Reason = 'prefix-dash';       return $out }
+        '.' { $out.Match = $true; $out.Reason = 'prefix-dot';        return $out }
+        ' ' {
+            $rest = $stem.Substring($db.Length + 1)
+            if ($rest -match '^\d{8}\s+\d{4}$') {
+                $out.Match = $true
+                $out.Reason = 'stamped'
+            } else {
+                $out.Reason = 'stamped-bad-format'
             }
+            return $out
+        }
+        default {
+            $out.Reason = 'prefix-bleed'
+            return $out
+        }
+    }
+}
+
+function Get-SqlCpyRestoreClosestCandidate {
+<#
+.SYNOPSIS
+    Returns a heuristic "closest" candidate filename for diagnostic logging
+    when no file matched a requested database name.
+
+.DESCRIPTION
+    Purely informational: scans a candidate list for the entry whose stem
+    shares the longest case-insensitive common prefix with the requested
+    database name, or whose stem contains the database name as a
+    substring. Breaks ties by filename length (shorter first) for
+    deterministic output. Never influences the real matcher - the output
+    is written to a WARN line so the user can see a probable alias
+    candidate (e.g. "timesheet" -> "mTimesheet 20260420 0633.bak").
+
+.PARAMETER Database
+    Requested database name.
+
+.PARAMETER CandidateFiles
+    Enumeration of objects with a Name property.
+
+.OUTPUTS
+    The best-guess candidate object, or $null when none is plausible.
+#>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [Parameter(Mandatory)] [AllowEmptyString()] [string]$Database,
+        [object[]]$CandidateFiles
+    )
+
+    if (-not $CandidateFiles -or $CandidateFiles.Count -eq 0) { return $null }
+    if ([string]::IsNullOrWhiteSpace($Database)) { return $null }
+    $dbL = $Database.Trim().ToLowerInvariant()
+    if ($dbL.Length -lt 2) { return $null }
+
+    $scored = foreach ($f in $CandidateFiles) {
+        if (-not $f -or -not $f.Name) { continue }
+        $stem = [System.IO.Path]::GetFileNameWithoutExtension([string]$f.Name)
+        if ([string]::IsNullOrEmpty($stem)) { continue }
+        $stemL = $stem.ToLowerInvariant()
+
+        $common = 0
+        $max = [Math]::Min($stemL.Length, $dbL.Length)
+        while ($common -lt $max -and $stemL[$common] -eq $dbL[$common]) { $common++ }
+
+        $contains = $stemL.IndexOf($dbL, [StringComparison]::OrdinalIgnoreCase) -ge 0
+        $score = $common
+        if ($contains) { $score += $dbL.Length }  # strong bonus for substring hit
+
+        [pscustomobject]@{
+            File     = $f
+            Score    = $score
+            NameLen  = $stem.Length
         }
     }
 
-    return $false
+    $best = $scored |
+        Where-Object { $_.Score -gt 0 } |
+        Sort-Object -Property @{ Expression = 'Score'; Descending = $true }, @{ Expression = 'NameLen'; Descending = $false } |
+        Select-Object -First 1
+
+    if ($best) { return $best.File }
+    return $null
 }
 
 function Get-SqlCpyRestoreBackupTimestamp {
@@ -339,6 +563,31 @@ function Invoke-SqlCpyDatabaseRestore {
          NoRecovery / DestinationDataDirectory / DestinationLogDirectory /
          StatementTimeout as configured.
 
+    Diagnostic logging:
+      * The resolved UNC backup path is logged verbatim so the reader can
+        see the exact string that will be handed to Test-Path.
+      * Whether Test-Path succeeded or failed against the configured path
+        is logged explicitly, because a $ character in a hidden share name
+        is a common source of confusion (it is fine in the path string;
+        share permissions / account context are the usual culprits).
+      * The total count of files enumerated in the folder and a capped
+        preview of candidate filenames (with extension, timestamp and
+        length) is logged so the user can see what the tool actually saw.
+        The preview cap is controlled by
+        DatabaseRestoreLogCandidateLimit (default 50).
+      * For each requested database, every candidate's match decision is
+        logged with a short reason code ("exact-stem", "prefix-bleed",
+        "stamped", "stamped-bad-format", "stem-mismatch",
+        "ext-excluded", "pattern-excluded"). When the request produced no
+        match, the closest plausible candidate is surfaced as a hint so
+        the user can see whether an alias is needed (e.g. "timesheet" ->
+        "mTimesheet 20260420 0633.bak") without loosening the matcher.
+      * Strict matching is NOT relaxed. To accept a logical name that does
+        not match the on-share base name, configure
+        DatabaseRestoreNameAliases in the psd1 config (e.g.
+        @{ timesheet = 'mTimesheet' }). No alias is applied unless
+        explicitly configured.
+
 .PARAMETER TargetServer
     Target SQL Server instance name.
 
@@ -388,8 +637,72 @@ function Invoke-SqlCpyDatabaseRestore {
     Write-SqlCpyStep ("Restoring databases to $TargetServer from $($rc.BackupPath) (DryRun=$DryRun)")
     Write-SqlCpyInfo ("Restore action RESTORES FULL DATABASES WITH DATA (not schema-only).")
 
-    if (-not (Test-Path -LiteralPath $rc.BackupPath)) {
-        Write-SqlCpyWarning ("Backup path not reachable: $($rc.BackupPath). Individual database lookups will still be attempted.")
+    # Echo the exact path string so nothing is hidden: if any PowerShell
+    # escaping or quoting mangled the "$" in the hidden share name, the
+    # value logged here will differ from the user's expectation and make
+    # the problem visible immediately.
+    Write-SqlCpyInfo ("Backup path (raw): [{0}]" -f $rc.BackupPath)
+    Write-SqlCpyInfo ("Backup path length: {0} chars" -f $rc.BackupPath.Length)
+    Write-SqlCpyInfo ("Accepted extensions: {0}" -f ($rc.FileExtensions -join ', '))
+    if ($rc.FilePattern) {
+        Write-SqlCpyInfo ("File pattern filter: {0}" -f $rc.FilePattern)
+    } else {
+        Write-SqlCpyInfo "File pattern filter: <none>"
+    }
+    if ($rc.NameAliases -and $rc.NameAliases.Count -gt 0) {
+        $aliasPairs = foreach ($k in @($rc.NameAliases.Keys)) {
+            "{0} -> {1}" -f $k, $rc.NameAliases[$k]
+        }
+        Write-SqlCpyInfo ("Name aliases configured: {0}" -f ($aliasPairs -join '; '))
+    } else {
+        Write-SqlCpyInfo "Name aliases configured: <none>"
+    }
+
+    $pathReachable = Test-Path -LiteralPath $rc.BackupPath
+    if ($pathReachable) {
+        Write-SqlCpyInfo ("Backup path Test-Path: OK")
+    } else {
+        Write-SqlCpyWarning ("Backup path Test-Path: FAILED against [{0}]. Individual database lookups will still be attempted." -f $rc.BackupPath)
+        Write-SqlCpyWarning ("Hint: the `$ character in hidden share names is valid in the path string. If Test-Path fails, check (a) the PowerShell host account has read access to the hidden share, (b) the server name resolves from this host, (c) the share '-backup`$' exists and is not disabled. Try from the same shell: Test-Path -LiteralPath '{0}' and Get-ChildItem -LiteralPath '{0}' | Select -First 5" -f $rc.BackupPath)
+    }
+
+    # Enumerate the folder once up-front so we can log what we found there
+    # regardless of per-database matching, and so every database uses the
+    # same snapshot of the filesystem (cheap correctness win, and makes
+    # the diagnostic output deterministic across the loop).
+    $allFiles = @()
+    if ($pathReachable) {
+        try {
+            $allFiles = @(Get-ChildItem -Path $rc.BackupPath -File -ErrorAction Stop)
+        } catch {
+            Write-SqlCpyWarning ("Get-ChildItem on [{0}] failed: {1}" -f $rc.BackupPath, $_.Exception.Message)
+            $allFiles = @()
+        }
+    }
+
+    Write-SqlCpyInfo ("Folder enumeration: {0} file(s) visible in backup path" -f $allFiles.Count)
+
+    if ($allFiles.Count -eq 0 -and $pathReachable) {
+        Write-SqlCpyWarning ("Backup path [{0}] is reachable but contains no files. Check whether the scheduled backup job is writing to the expected share." -f $rc.BackupPath)
+    }
+
+    if ($allFiles.Count -gt 0) {
+        $limit = [int]$rc.LogCandidateLimit
+        if ($limit -lt 0) { $limit = 0 }
+        $shown = if ($limit -eq 0) { $allFiles.Count } else { [Math]::Min($limit, $allFiles.Count) }
+        Write-SqlCpyInfo ("Folder contents (showing {0} of {1}; cap via DatabaseRestoreLogCandidateLimit):" -f $shown, $allFiles.Count)
+        for ($i = 0; $i -lt $shown; $i++) {
+            $f = $allFiles[$i]
+            $ext = [System.IO.Path]::GetExtension($f.Name)
+            $lwt = ''
+            $len = ''
+            try { if ($f.LastWriteTime) { $lwt = ([datetime]$f.LastWriteTime).ToString('yyyy-MM-dd HH:mm:ss') } } catch { }
+            try { if ($f.Length)        { $len = [string]$f.Length } } catch { }
+            Write-SqlCpyInfo ("  [{0,3}] {1}  (ext={2}, LastWriteTime={3}, Length={4})" -f ($i + 1), $f.Name, $ext, $lwt, $len)
+        }
+        if ($allFiles.Count -gt $shown) {
+            Write-SqlCpyInfo ("  ... {0} more file(s) not shown (raise DatabaseRestoreLogCandidateLimit to see them)" -f ($allFiles.Count - $shown))
+        }
     }
 
     $haveDbatools = [bool](Get-Command -Name Restore-DbaDatabase -ErrorAction SilentlyContinue)
@@ -403,18 +716,92 @@ function Invoke-SqlCpyDatabaseRestore {
         $tgtConn = Get-SqlCpyCachedConnection -Config $Config -Role 'Target' -Server $TargetServer -Credential $Config.TargetCredential
     }
 
-    foreach ($db in $Databases) {
-        $db = [string]$db
-        if ([string]::IsNullOrWhiteSpace($db)) { continue }
+    # Build the extension lookup once so per-file diagnostics and the main
+    # matcher agree on which extensions count.
+    $extSet = @{}
+    foreach ($e in $rc.FileExtensions) {
+        if (-not $e) { continue }
+        $s = [string]$e
+        if (-not $s.StartsWith('.')) { $s = '.' + $s }
+        $extSet[$s.ToLowerInvariant()] = $true
+    }
 
-        $candidates = Find-SqlCpyDatabaseBackupFile `
-            -BackupPath     $rc.BackupPath `
-            -Database       $db `
-            -FileExtensions $rc.FileExtensions `
-            -FilePattern    $rc.FilePattern
+    foreach ($rawDb in $Databases) {
+        $rawDb = [string]$rawDb
+        if ([string]::IsNullOrWhiteSpace($rawDb)) { continue }
+        $requested = $rawDb.Trim()
+        $resolved  = Resolve-SqlCpyRestoreDatabaseAlias -Database $requested -Aliases $rc.NameAliases
+
+        if (-not [string]::Equals($requested, $resolved, [StringComparison]::OrdinalIgnoreCase)) {
+            Write-SqlCpyInfo ("Match target for '{0}': requested name is aliased to '{1}' via DatabaseRestoreNameAliases; files will be matched against '{1}'." -f $requested, $resolved)
+        } else {
+            Write-SqlCpyInfo ("Match target for '{0}': no alias configured; files will be matched strictly against '{0}'." -f $requested)
+        }
+
+        # Per-candidate diagnostic log. Walks the same snapshot used by
+        # Find-SqlCpyDatabaseBackupFile and attributes each discard to a
+        # short reason, so "why was this skipped?" is answerable from the
+        # log alone.
+        $matchedFiles = @()
+        if ($allFiles.Count -gt 0) {
+            foreach ($f in $allFiles) {
+                if (-not $f -or -not $f.Name) { continue }
+                $ext = [System.IO.Path]::GetExtension($f.Name)
+                if (-not $ext -or -not $extSet.ContainsKey($ext.ToLowerInvariant())) {
+                    Write-SqlCpyInfo ("  discard '{0}': ext-excluded ({1} not in accepted extensions)" -f $f.Name, $ext)
+                    continue
+                }
+                if ($rc.FilePattern -and ($f.Name -notlike $rc.FilePattern)) {
+                    Write-SqlCpyInfo ("  discard '{0}': pattern-excluded (does not match {1})" -f $f.Name, $rc.FilePattern)
+                    continue
+                }
+                $reason = Get-SqlCpyRestoreMatchReason -FileName $f.Name -Database $resolved
+                if ($reason.Match) {
+                    $stamp = Get-SqlCpyRestoreBackupTimestamp -FileName $f.Name -Database $resolved
+                    $stampText = if ($stamp) { $stamp.ToString('yyyy-MM-dd HH:mm:ss') } else { '<no stamp>' }
+                    Write-SqlCpyInfo ("  candidate '{0}': MATCH ({1}), stamped={2}" -f $f.Name, $reason.Reason, $stampText)
+                    $matchedFiles += $f
+                } else {
+                    Write-SqlCpyInfo ("  discard '{0}': {1}" -f $f.Name, $reason.Reason)
+                }
+            }
+        }
+
+        # Delegate the real selection (with stamped-first sort) to
+        # Find-SqlCpyDatabaseBackupFile so diagnostics stay consistent
+        # with the production matcher. Passing -CandidateFiles reuses our
+        # snapshot and avoids re-enumerating the share.
+        $candidates = if ($allFiles.Count -gt 0) {
+            Find-SqlCpyDatabaseBackupFile `
+                -BackupPath     $rc.BackupPath `
+                -Database       $resolved `
+                -FileExtensions $rc.FileExtensions `
+                -FilePattern    $rc.FilePattern `
+                -CandidateFiles $allFiles
+        } else {
+            Find-SqlCpyDatabaseBackupFile `
+                -BackupPath     $rc.BackupPath `
+                -Database       $resolved `
+                -FileExtensions $rc.FileExtensions `
+                -FilePattern    $rc.FilePattern
+        }
 
         if (-not $candidates -or $candidates.Count -eq 0) {
-            Write-SqlCpyWarning ("backup not found for database $db in path $($rc.BackupPath); skipping")
+            if ($allFiles.Count -eq 0) {
+                Write-SqlCpyWarning ("backup not found for database {0} in path {1}; skipping" -f $requested, $rc.BackupPath)
+                if (-not $pathReachable) {
+                    Write-SqlCpyWarning ("Root cause likely not the matcher: backup path is unreachable. Verify UNC accessibility from this PowerShell host's account and that the hidden share ('-backup`$') grants read to that account. The '`$' in the share name is fine in the path string.")
+                } else {
+                    Write-SqlCpyWarning ("Path is reachable but empty or unreadable for the current account. Hidden shares with '`$' require an explicit permission grant; single-quote the path in config to avoid shell interpolation.")
+                }
+            } else {
+                $closest = Get-SqlCpyRestoreClosestCandidate -Database $resolved -CandidateFiles $allFiles
+                if ($closest) {
+                    Write-SqlCpyWarning ("No exact/stamped match for '{0}' in {1}. Closest candidate appears to be '{2}'. Matching is strict - configure DatabaseRestoreNameAliases (e.g. @{{ {0} = '{3}' }}) or request the on-share base name directly." -f $requested, $rc.BackupPath, $closest.Name, [System.IO.Path]::GetFileNameWithoutExtension($closest.Name))
+                } else {
+                    Write-SqlCpyWarning ("backup not found for database {0} in path {1}; skipping (folder had {2} file(s) but none matched; no plausible close candidate)" -f $requested, $rc.BackupPath, $allFiles.Count)
+                }
+            }
             continue
         }
 
@@ -424,19 +811,21 @@ function Invoke-SqlCpyDatabaseRestore {
         if ($chosen.PSObject.Properties['LastWriteTime']) { $chosenStamp = $chosen.LastWriteTime }
 
         if ($candidates.Count -gt 1) {
-            Write-SqlCpyInfo ("{0}: {1} candidate backup(s) found; picking newest: {2}" -f $db, $candidates.Count, $chosen.Name)
+            Write-SqlCpyInfo ("{0}: {1} candidate backup(s) found; selected newest stamped backup: {2}" -f $requested, $candidates.Count, $chosen.Name)
+        } else {
+            Write-SqlCpyInfo ("{0}: 1 candidate backup found; selected: {1}" -f $requested, $chosen.Name)
         }
 
         if ($DryRun) {
             $stampText = if ($chosenStamp) { $chosenStamp.ToString('yyyy-MM-dd HH:mm:ss') } else { 'unknown timestamp' }
-            Write-SqlCpyInfo ("DRYRUN would restore {0} from {1} as {0} ({2})" -f $db, $chosenPath, $stampText)
+            Write-SqlCpyInfo ("DRYRUN would restore {0} from {1} as {0} ({2})" -f $requested, $chosenPath, $stampText)
             continue
         }
 
         $restoreSplat = @{
             SqlInstance    = $tgtConn
             Path           = $chosenPath
-            DatabaseName   = $db
+            DatabaseName   = $requested
             EnableException = $true
         }
         if ($rc.WithReplace) { $restoreSplat['WithReplace'] = $true }
@@ -455,20 +844,20 @@ function Invoke-SqlCpyDatabaseRestore {
         if (Get-Command -Name Read-DbaBackupHeader -ErrorAction SilentlyContinue) {
             try {
                 $hdr = Read-DbaBackupHeader -SqlInstance $tgtConn -Path $chosenPath -ErrorAction Stop | Select-Object -First 1
-                if ($hdr -and $hdr.DatabaseName -and -not [string]::Equals([string]$hdr.DatabaseName, $db, [StringComparison]::OrdinalIgnoreCase)) {
-                    Write-SqlCpyWarning ("{0}: backup header reports DatabaseName='{1}' (different from requested). Proceeding with restore as '{0}' because -DatabaseName overrides the backup's embedded name." -f $db, $hdr.DatabaseName)
+                if ($hdr -and $hdr.DatabaseName -and -not [string]::Equals([string]$hdr.DatabaseName, $requested, [StringComparison]::OrdinalIgnoreCase)) {
+                    Write-SqlCpyWarning ("{0}: backup header reports DatabaseName='{1}' (different from requested). Proceeding with restore as '{0}' because -DatabaseName overrides the backup's embedded name." -f $requested, $hdr.DatabaseName)
                 }
             } catch {
-                Write-SqlCpyWarning ("{0}: Read-DbaBackupHeader failed ({1}); continuing." -f $db, $_.Exception.Message)
+                Write-SqlCpyWarning ("{0}: Read-DbaBackupHeader failed ({1}); continuing." -f $requested, $_.Exception.Message)
             }
         }
 
-        Write-SqlCpyInfo ("Restoring {0} <- {1}" -f $db, $chosenPath)
+        Write-SqlCpyInfo ("Restoring {0} <- {1}" -f $requested, $chosenPath)
         try {
             Restore-DbaDatabase @restoreSplat | Out-Null
-            Write-SqlCpyInfo ("Restore complete: {0}" -f $db)
+            Write-SqlCpyInfo ("Restore complete: {0}" -f $requested)
         } catch {
-            Write-SqlCpyError ("Restore failed for {0}: {1}" -f $db, $_.Exception.Message)
+            Write-SqlCpyError ("Restore failed for {0}: {1}" -f $requested, $_.Exception.Message)
             # Do not throw - continue with remaining databases, matching the
             # "missing backup is not fatal" spirit of this action.
         }

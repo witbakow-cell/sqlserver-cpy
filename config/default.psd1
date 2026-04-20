@@ -108,6 +108,31 @@
     DatabaseRestoreDataFileDirectory = $null
     DatabaseRestoreLogFileDirectory  = $null
 
+    # Diagnostics: cap the number of per-file preview lines that the restore
+    # action writes to the log when it enumerates the backup folder up-front.
+    # The full file count is always logged; this only bounds the preview.
+    # Set to 0 to show every file (can be noisy on large shares). Default 50
+    # is enough to diagnose "my database name did not match" cases like
+    # `mTimesheet 20260420 0633.bak` vs a request for `timesheet`.
+    DatabaseRestoreLogCandidateLimit = 50
+
+    # Optional aliases from the user-facing database name to the base name
+    # the backup file on the share actually uses. The restore matcher is
+    # strict on purpose (a request for "timesheet" will NOT match
+    # "mTimesheet 20260420 0633.bak") so that "mydb" does not leak into
+    # "mydb2" etc. If your share uses a prefix convention like the example,
+    # declare the alias here rather than loosening the matcher:
+    #
+    #   DatabaseRestoreNameAliases = @{
+    #       timesheet  = 'mTimesheet'
+    #       purchasing = 'mPurchasing'
+    #   }
+    #
+    # Keys are compared case-insensitively. Values should be the exact stem
+    # prefix used in the backup filenames on the share. An empty hashtable
+    # (the default) disables aliasing entirely.
+    DatabaseRestoreNameAliases = @{}
+
     # Databases to copy as schema-only (no data). Empty array = none selected by default.
     SchemaOnlyDatabaseList = @()
 

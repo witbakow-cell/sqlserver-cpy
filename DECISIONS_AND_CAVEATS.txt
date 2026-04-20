@@ -520,3 +520,76 @@ Caveats specific to the restore action
 - No log-chain replay. Only the single newest FULL backup per database is
   applied. If you need differentials or log backups replayed on top,
   implement that outside this action or extend Invoke-SqlCpyDatabaseRestore.
+
+
+Strict filename matching and the NameAliases escape hatch
+---------------------------------------------------------
+The backup-file matcher used by Invoke-SqlCpyDatabaseRestore accepts only
+a small, explicit set of stem shapes (exact stem, "<db>_…", "<db>-…",
+"<db>.…", and the stamped "<db> yyyyMMdd HHmm" layout). Substring
+matches are deliberately NOT allowed. Rationale:
+
+- A permissive contains/startswith match would pull siblings into the
+  candidate list. "mPurchasing" would match "mPurchasing2" and
+  "mPurchasing_dev", and "dw" would match every DW-prefixed database on
+  the share. Picking the "newest" of a mixed list would then restore the
+  wrong database under the requested name, silently.
+
+- The on-share naming convention (`mTimesheet`, `mPurchasing`, `DwControl`,
+  …) does not necessarily match the logical name the user types when
+  driving the TUI. The user can request `timesheet` and expect the
+  matcher to find `mTimesheet 20260420 0633.bak`, but that is a
+  name-mapping problem, not a matcher-sensitivity problem.
+
+Resolution: a DatabaseRestoreNameAliases hashtable on the config.
+
+    DatabaseRestoreNameAliases = @{
+        timesheet  = 'mTimesheet'
+        purchasing = 'mPurchasing'
+    }
+
+When set, Resolve-SqlCpyRestoreDatabaseAlias rewrites the user's input
+BEFORE it reaches the matcher. The restore itself still creates a
+database with the ORIGINAL requested name on the target, so the alias
+only controls on-share file matching. Default is an empty hashtable
+(aliases disabled) so existing behaviour is unchanged.
+
+
+Diagnostic logging for restore failures
+---------------------------------------
+Context: user reported that running the restore action against
+\\chbbopa2\CHBBBID2-backup$\FULL with database "timesheet" logged only
+"backup not found for database timesheet in path … ; skipping", even
+though mTimesheet 20260420 0633.bak was visible on the share. The original
+log gave no signal whether the path was unreachable, the folder was
+empty, the extension filter rejected everything, or the name match
+failed - so the user could not tell whether the `$` in the share name,
+permissions, or the matcher was to blame.
+
+Fix: Invoke-SqlCpyDatabaseRestore now logs, on every run:
+
+  * the raw backup path string and its length (makes PowerShell escaping
+    of "$" and backslashes visible),
+  * the result of Test-Path against that path,
+  * the total file count in the folder and a capped preview (with
+    extension, LastWriteTime and Length) so the reader can see what the
+    tool saw, bounded by DatabaseRestoreLogCandidateLimit (default 50,
+    0 = no cap),
+  * for each requested database, a line per candidate with either a
+    match reason (exact-stem, prefix-underscore, prefix-dash,
+    prefix-dot, stamped) or a discard reason (ext-excluded,
+    pattern-excluded, prefix-bleed, stamped-bad-format,
+    stem-shorter-than-db, stem-mismatch),
+  * when nothing matched but the folder is non-empty, a follow-up WARN
+    with the closest plausible filename (heuristic, diagnostic only -
+    never influences the real matcher) and a pointer to
+    DatabaseRestoreNameAliases,
+  * when the folder is unreachable or empty, a hint that the "$" in
+    hidden share names is fine in the path string itself but the
+    PowerShell host account needs an explicit read grant on the share.
+
+The goal is that a log alone tells the user whether the problem is
+UNC reachability, share permissions, the extension filter, the
+pattern filter, a typo, or a missing alias. The matcher was NOT
+loosened; the user chose strict matching and an explicit alias map as
+the recovery path.

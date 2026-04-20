@@ -283,12 +283,20 @@ consumes them.
   and calls `Restore-DbaDatabase` on the target. Missing backups log a
   `WARN backup not found for database <X> in path <Y>; skipping` and the
   loop continues. Honours `DryRun`. Does not contact the source SQL
-  Server.
+  Server. Emits detailed diagnostics on every run: raw path and
+  `Test-Path` result, capped folder preview (size controlled by
+  `DatabaseRestoreLogCandidateLimit`, default 50), per-candidate match
+  reason, and a closest-candidate hint when nothing matched. Strict
+  matching is retained; to accept a name that does not match the on-share
+  stem, configure `DatabaseRestoreNameAliases` (e.g.
+  `@{ timesheet = 'mTimesheet' }`).
 - **`Get-SqlCpyDatabaseRestoreConfig`** — Pure helper that normalises
   restore-related config keys with defaults, including the default UNC
-  path, the default extension list (`.bak`, `.backup`), and the restore
-  flags (`WithReplace`, `NoRecovery`, timeout, data/log relocation).
-  Exercised directly in `tests/Syntax.Tests.ps1`.
+  path, the default extension list (`.bak`, `.backup`), the restore
+  flags (`WithReplace`, `NoRecovery`, timeout, data/log relocation),
+  the diagnostic `LogCandidateLimit` (default 50), and the optional
+  `NameAliases` hashtable. Exercised directly in
+  `tests/Syntax.Tests.ps1`.
 - **`Find-SqlCpyDatabaseBackupFile`** — Pure-enumeration helper that
   returns candidate backup files for one database, newest first. Accepts
   either a real path (uses `Get-ChildItem`) or, via `-CandidateFiles`,
@@ -303,6 +311,26 @@ consumes them.
   layout `<db> <yyyyMMdd> <HHmm>.bak` (case-insensitive). Avoids false
   positives like `mydb2.bak` or `mydb2 20260420 0633.bak` matching
   database `mydb`. Unit-tested.
+- **`Get-SqlCpyRestoreMatchReason`** — Pure string helper. Same rules as
+  `Test-SqlCpyRestoreFileMatchesDatabase` but returns a pscustomobject
+  with a stable reason code (`exact-stem`, `prefix-underscore`,
+  `prefix-dash`, `prefix-dot`, `stamped` for matches;
+  `prefix-bleed`, `stamped-bad-format`, `stem-shorter-than-db`,
+  `stem-mismatch`, `empty-filename`, `empty-database`, `no-stem` for
+  discards). Used by `Invoke-SqlCpyDatabaseRestore` to label every
+  candidate in the diagnostic log.
+- **`Get-SqlCpyRestoreClosestCandidate`** — Diagnostic heuristic. Given a
+  database name and a candidate list, returns the filename with the
+  longest case-insensitive common prefix (with a substring bonus) or
+  `$null` when nothing is plausible. NEVER used by the real matcher;
+  the output is logged so the user can see a likely alias target - e.g.
+  a request for `timesheet` points at `mTimesheet 20260420 0633.bak`.
+- **`Resolve-SqlCpyRestoreDatabaseAlias`** — Pure string helper that
+  maps a user-supplied database name to its on-share base name via
+  `DatabaseRestoreNameAliases` (case-insensitive key match). Returns
+  the input unchanged when no alias applies or the hashtable is empty /
+  null. Lets the user keep the strict matcher while aliasing logical
+  names (`timesheet`) to on-share base names (`mTimesheet`).
 - **`Get-SqlCpyRestoreBackupTimestamp`** — Pure string helper. Parses
   the trailing `<yyyyMMdd> <HHmm>` in a stamped backup filename and
   returns the resulting `[datetime]`, or `$null` if the filename does
