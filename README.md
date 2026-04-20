@@ -440,15 +440,21 @@ Key differences from the schema-only copy:
 3. For each database the tool:
    - lists files in the configured path;
    - filters by extension (`.bak`, `.backup` by default) and by name match
-     (the stem must equal the database name or start with `<db>_`, `<db>-`,
-     or `<db>.`);
-   - picks the newest matching file;
-   - restores to the target using `Restore-DbaDatabase`.
+     (the stem must equal the database name, start with `<db>_`, `<db>-`,
+     or `<db>.`, OR match the timestamped FULL-share layout
+     `<db> <yyyyMMdd> <HHmm>.bak`, e.g. `mPurchasing 20260420 0633.bak`);
+   - picks the newest matching file (newest timestamp baked into the
+     filename wins when the stamped layout is used; otherwise newest
+     `LastWriteTime`);
+   - restores to the target using `Restore-DbaDatabase` with
+     `-DatabaseName` pinned to the clean requested name (`mPurchasing`),
+     NOT the filename stem or the backup header's embedded name.
 4. If no matching backup exists, the tool emits
    `WARN backup not found for database <X> in path <Y>; skipping` and moves on -
    a missing backup is **not** fatal.
 5. In `DryRun = $true` the tool logs what it would have restored without
-   touching the target.
+   touching the target, e.g.
+   `INFO DRYRUN would restore mPurchasing from \\chbbopa2\CHBBBID2-backup$\FULL\mPurchasing 20260420 0633.bak as mPurchasing (2026-04-20 06:33:00)`.
 
 ### Configuration keys
 

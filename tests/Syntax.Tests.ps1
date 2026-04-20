@@ -1290,6 +1290,203 @@ try {
 }
 
 Write-Host ''
+Write-Host 'Checking timestamped FULL-share backup matching...' -ForegroundColor Cyan
+try {
+    # Confirm the stamped-layout matcher lives in the restore file.
+    $restoreFile = Join-Path -Path $repoRoot -ChildPath 'src/SqlServerCpy/Public/DatabaseRestore.ps1'
+
+    # Positives: "<db> yyyyMMdd HHmm.bak" as produced by the FULL backup share.
+    $stampedPositive = @(
+        @{ File = 'mPurchasing 20260420 0633.bak';   Db = 'mPurchasing' }
+        @{ File = 'mTimesheet 20260420 0633.bak';    Db = 'mTimesheet'  }
+        @{ File = 'DwControl 20260420 0633.bak';     Db = 'DwControl'   }
+        @{ File = 'DWCONTROL 20260420 0633.BAK';     Db = 'dwcontrol'   }  # case-insensitive
+        @{ File = '_CANBERRA 20260420 0633.bak';     Db = '_CANBERRA'   }
+        @{ File = 'SSISDB 20260420 0633.bak';        Db = 'SSISDB'      }
+    )
+    foreach ($c in $stampedPositive) {
+        $got = Test-SqlCpyRestoreFileMatchesDatabase -FileName $c.File -Database $c.Db
+        if (-not $got) {
+            $failures += [pscustomobject]@{
+                File   = $restoreFile
+                Errors = "Stamped layout should match: '$($c.File)' vs '$($c.Db)' = $got"
+            }
+        } else {
+            Write-Host ("  OK  stamped match '{0}' ~ '{1}'" -f $c.File, $c.Db)
+        }
+    }
+
+    # False-positive guards: no substring bleed across DB names.
+    $stampedNegative = @(
+        @{ File = 'mydb2 20260420 0633.bak';       Db = 'mydb'       }  # length bleed
+        @{ File = 'mPurchasing2 20260420 0633.bak'; Db = 'mPurchasing' }
+        @{ File = 'mPurchasing20260420 0633.bak';  Db = 'mPurchasing' }  # missing space after name
+        @{ File = 'mPurchasing 2026042 0633.bak';  Db = 'mPurchasing' }  # 7-digit date
+        @{ File = 'mPurchasing 20260420 063.bak';  Db = 'mPurchasing' }  # 3-digit time
+        @{ File = 'mPurchasing 20260420.bak';      Db = 'mPurchasing' }  # no time
+        @{ File = 'mPurchasing 20260420 0633 extra.bak'; Db = 'mPurchasing' }  # trailing junk
+    )
+    foreach ($c in $stampedNegative) {
+        $got = Test-SqlCpyRestoreFileMatchesDatabase -FileName $c.File -Database $c.Db
+        if ($got) {
+            $failures += [pscustomobject]@{
+                File   = $restoreFile
+                Errors = "Stamped layout false-positive: '$($c.File)' must not match '$($c.Db)'"
+            }
+        } else {
+            Write-Host ("  OK  stamped non-match '{0}' !~ '{1}'" -f $c.File, $c.Db)
+        }
+    }
+
+    # Get-SqlCpyRestoreBackupTimestamp parses the trailing timestamp and returns
+    # $null for files that do not match the stamped layout.
+    $ts = Get-SqlCpyRestoreBackupTimestamp -FileName 'mPurchasing 20260420 0633.bak' -Database 'mPurchasing'
+    if (-not $ts -or $ts.Year -ne 2026 -or $ts.Month -ne 4 -or $ts.Day -ne 20 -or $ts.Hour -ne 6 -or $ts.Minute -ne 33) {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "Get-SqlCpyRestoreBackupTimestamp returned unexpected value for stamped filename: $ts"
+        }
+    } else {
+        Write-Host "  OK  Get-SqlCpyRestoreBackupTimestamp parsed '2026-04-20 06:33'"
+    }
+
+    # Case-insensitive stamp parse.
+    $tsCase = Get-SqlCpyRestoreBackupTimestamp -FileName 'DWCONTROL 20260420 0633.BAK' -Database 'dwcontrol'
+    if (-not $tsCase) {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = 'Get-SqlCpyRestoreBackupTimestamp must be case-insensitive on the DB prefix.'
+        }
+    } else {
+        Write-Host "  OK  Get-SqlCpyRestoreBackupTimestamp is case-insensitive on DB prefix"
+    }
+
+    # Stamp-less filename -> $null.
+    $tsNone = Get-SqlCpyRestoreBackupTimestamp -FileName 'mPurchasing.bak' -Database 'mPurchasing'
+    if ($null -ne $tsNone) {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "Get-SqlCpyRestoreBackupTimestamp should return `$null for stamp-less filenames; got $tsNone"
+        }
+    } else {
+        Write-Host "  OK  Get-SqlCpyRestoreBackupTimestamp returns `$null without a stamp"
+    }
+
+    # Newest-stamp wins when multiple stamped candidates exist for the same DB.
+    $mkCandidate2 = {
+        param($n, $t)
+        [pscustomobject]@{
+            Name          = $n
+            FullName      = "\\share\FULL\$n"
+            LastWriteTime = [datetime]$t
+        }
+    }
+
+    # Note: LastWriteTime on the OLDER stamp is intentionally the NEWEST on
+    # disk, so a correct implementation must ignore it and pick by stamp.
+    $stamped = @(
+        & $mkCandidate2 'mPurchasing 20260419 0633.bak' '2099-01-01 00:00:00'
+        & $mkCandidate2 'mPurchasing 20260420 0633.bak' '2020-01-01 00:00:00'
+        & $mkCandidate2 'mPurchasing 20260418 1900.bak' '2021-01-01 00:00:00'
+    )
+    $picked = Find-SqlCpyDatabaseBackupFile `
+        -BackupPath '\\share\FULL' `
+        -Database   'mPurchasing' `
+        -FileExtensions @('.bak', '.backup') `
+        -CandidateFiles $stamped
+    if (-not $picked -or $picked.Count -ne 3) {
+        $failures += [pscustomobject]@{
+            File   = 'Find-SqlCpyDatabaseBackupFile (stamped)'
+            Errors = "Expected 3 stamped mPurchasing candidates; got $($picked.Count)"
+        }
+    } elseif ($picked[0].Name -ne 'mPurchasing 20260420 0633.bak') {
+        $failures += [pscustomobject]@{
+            File   = 'Find-SqlCpyDatabaseBackupFile (stamped)'
+            Errors = "Expected newest-by-stamp first (mPurchasing 20260420 0633.bak); got '$($picked[0].Name)'"
+        }
+    } else {
+        Write-Host "  OK  Find-SqlCpyDatabaseBackupFile picks newest by filename stamp"
+    }
+
+    # Mixed stamped + stamp-less: any stamped file must sort ahead of the
+    # stamp-less one even when the latter has a very recent mtime.
+    $mixed = @(
+        & $mkCandidate2 'mPurchasing 20260401 0100.bak' '2020-01-01 00:00:00'
+        & $mkCandidate2 'mPurchasing.bak'               '2099-01-01 00:00:00'
+    )
+    $pickedMixed = Find-SqlCpyDatabaseBackupFile `
+        -BackupPath '\\share\FULL' `
+        -Database   'mPurchasing' `
+        -FileExtensions @('.bak') `
+        -CandidateFiles $mixed
+    if (-not $pickedMixed -or $pickedMixed[0].Name -ne 'mPurchasing 20260401 0100.bak') {
+        $failures += [pscustomobject]@{
+            File   = 'Find-SqlCpyDatabaseBackupFile (mixed)'
+            Errors = "Stamped file should sort ahead of stamp-less even with newer mtime; got '$($pickedMixed[0].Name)'"
+        }
+    } else {
+        Write-Host "  OK  stamped file sorts ahead of stamp-less entry"
+    }
+
+    # mPurchasing query must not pull in the similarly-named 'mPurchasing2' file.
+    $crossDb = @(
+        & $mkCandidate2 'mPurchasing 20260420 0633.bak'  '2026-04-20 06:33:00'
+        & $mkCandidate2 'mPurchasing2 20260420 0633.bak' '2026-04-20 06:33:00'
+        & $mkCandidate2 'mTimesheet 20260420 0633.bak'   '2026-04-20 06:33:00'
+    )
+    $pickCross = Find-SqlCpyDatabaseBackupFile `
+        -BackupPath '\\share\FULL' `
+        -Database   'mPurchasing' `
+        -FileExtensions @('.bak') `
+        -CandidateFiles $crossDb
+    if (-not $pickCross -or $pickCross.Count -ne 1 -or $pickCross[0].Name -ne 'mPurchasing 20260420 0633.bak') {
+        $failures += [pscustomobject]@{
+            File   = 'Find-SqlCpyDatabaseBackupFile (cross-db)'
+            Errors = "Expected exactly one 'mPurchasing' match, not leakage to 'mPurchasing2'; got $($pickCross.Count) [$(@($pickCross.Name) -join ', ')]"
+        }
+    } else {
+        Write-Host "  OK  cross-DB guard: 'mPurchasing' does not pull 'mPurchasing2'"
+    }
+
+    # Invoke-SqlCpyDatabaseRestore must thread the clean requested DB name
+    # into the Restore-DbaDatabase splat as the target database (not the
+    # filename stem, not the backup header name). Inspect the source for
+    # the DatabaseName assignment and the DryRun log phrasing.
+    $restoreText = Get-Content -LiteralPath $restoreFile -Raw
+    if ($restoreText -notmatch "DatabaseName\s*=\s*\`$db") {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "Invoke-SqlCpyDatabaseRestore must pass -DatabaseName = `$db (clean requested name) to Restore-DbaDatabase."
+        }
+    } else {
+        Write-Host "  OK  restore splat uses -DatabaseName = `$db (clean requested name)"
+    }
+    if ($restoreText -notmatch 'would restore \{0\} from \{1\} as \{0\}') {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "DryRun log must use 'would restore <db> from <path> as <db>' phrasing with the clean target name."
+        }
+    } else {
+        Write-Host "  OK  DryRun log uses 'would restore <db> from <path> as <db>' phrasing"
+    }
+
+    # Manifest must export the new helper.
+    if ($manifest -and $manifest.FunctionsToExport -notcontains 'Get-SqlCpyRestoreBackupTimestamp') {
+        $failures += [pscustomobject]@{
+            File   = $manifestPath
+            Errors = "FunctionsToExport missing: Get-SqlCpyRestoreBackupTimestamp"
+        }
+    } else {
+        Write-Host "  OK  manifest exports Get-SqlCpyRestoreBackupTimestamp"
+    }
+} catch {
+    $failures += [pscustomobject]@{
+        File   = 'DatabaseRestore stamped-layout tests'
+        Errors = $_.Exception.Message
+    }
+}
+
+Write-Host ''
 if ($failures.Count -eq 0) {
     Write-Host 'All syntax and config checks passed.' -ForegroundColor Green
     exit 0

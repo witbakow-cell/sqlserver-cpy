@@ -440,13 +440,25 @@ Key design decisions
   and some without, and the user wants the ones that do have a backup to
   still get moved.
 
-- Name matching is strict. The filename stem must equal the database name or
-  start with <db>_ / <db>- / <db>. . This avoids false positives like
-  "mydb2.bak" matching database "mydb". See
-  Test-SqlCpyRestoreFileMatchesDatabase in DatabaseRestore.ps1 for the rule.
+- Name matching is strict. The filename stem must equal the database name,
+  start with <db>_ / <db>- / <db>., OR match the timestamped FULL-share
+  layout "<db> <yyyyMMdd> <HHmm>" (e.g. "mPurchasing 20260420 0633.bak").
+  This avoids false positives like "mydb2.bak" or
+  "mydb2 20260420 0633.bak" matching database "mydb". Matching is
+  case-insensitive. See Test-SqlCpyRestoreFileMatchesDatabase and
+  Get-SqlCpyRestoreBackupTimestamp in DatabaseRestore.ps1 for the rule.
   If another process uses a wildly different naming convention, either
   rename files on the share or set DatabaseRestoreFilePattern to narrow the
   matcher further.
+
+- Target database name is the CLEAN requested name. The restore action
+  ignores the backup filename's timestamp and the backup header's embedded
+  DatabaseName when choosing the target: Restore-DbaDatabase is called with
+  -DatabaseName set to the name the caller typed (e.g. "mPurchasing"). This
+  is what makes "mPurchasing, mTimesheet" a valid user input even though the
+  files on disk are "mPurchasing 20260420 0633.bak" and
+  "mTimesheet 20260420 0633.bak", and it also prevents the backup's
+  embedded name (if different) from silently renaming the restored DB.
 
 - FULL backups only. The default extension list is .bak and .backup.
   Transaction logs (.trn) are deliberately NOT picked up because there is no
@@ -454,8 +466,13 @@ Key design decisions
   outside this tool.
 
 - Picks the newest matching file. When several candidates match, the
-  LastWriteTime-descending sort picks the most recent one. This matches the
-  expected share layout where each full backup lands with a date stamp.
+  sort prefers the timestamp baked into the filename (yyyyMMdd HHmm) over
+  filesystem LastWriteTime, falling back to LastWriteTime-descending for
+  candidates that do not carry a stamp. A stamped file always sorts ahead
+  of a stamp-less file, even if the stamp-less file was written more
+  recently to disk. This matches the expected share layout where each full
+  backup lands with a date stamp and makes the selection deterministic
+  regardless of copy/move mtime updates on the share.
 
 - WithReplace = $true by default. A move operation where the target already
   has an older copy of the database should overwrite. Flip in local.psd1 if

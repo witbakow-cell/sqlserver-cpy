@@ -68,6 +68,7 @@
         'Get-SqlCpyDatabaseRestoreConfig'
         'Find-SqlCpyDatabaseBackupFile'
         'Test-SqlCpyRestoreFileMatchesDatabase'
+        'Get-SqlCpyRestoreBackupTimestamp'
     )
     CmdletsToExport   = @()
     VariablesToExport = @()

@@ -88,12 +88,15 @@ function Test-SqlCpyRestoreFileMatchesDatabase {
         MYDB_FULL_20240101.bak
         mydb-2024-01-01.bak
         mydb_backup_2024_01_01_120000.bak
+        mydb 20260420 0633.bak              (timestamped FULL share layout)
 
     The rule: the stem (filename minus extension) must either equal the
     database name, start with "<database>_", start with "<database>-",
-    or start with "<database>." (case-insensitive). A bare substring match
-    is intentionally NOT enough to avoid false positives like "mydb2.bak"
-    matching database "mydb".
+    start with "<database>." (case-insensitive), or match the timestamped
+    layout used by the backup share, i.e. "<database> <yyyyMMdd> <HHmm>".
+    A bare substring match is intentionally NOT enough to avoid false
+    positives like "mydb2.bak" matching database "mydb" or
+    "mydb2 20260420 0633.bak" matching "mydb".
 
 .PARAMETER FileName
     Filename only (not full path).
@@ -122,10 +125,72 @@ function Test-SqlCpyRestoreFileMatchesDatabase {
         if ([string]::Equals($prefix, $db, [StringComparison]::OrdinalIgnoreCase)) {
             $sep = $stem[$db.Length]
             if ($sep -eq '_' -or $sep -eq '-' -or $sep -eq '.') { return $true }
+            # Timestamped layout: "<db> <yyyyMMdd> <HHmm>"
+            if ($sep -eq ' ') {
+                $rest = $stem.Substring($db.Length + 1)
+                if ($rest -match '^\d{8}\s+\d{4}$') { return $true }
+            }
         }
     }
 
     return $false
+}
+
+function Get-SqlCpyRestoreBackupTimestamp {
+<#
+.SYNOPSIS
+    Parses the trailing "<yyyyMMdd> <HHmm>" timestamp of a stamped backup
+    filename and returns a [datetime], or $null if the filename does not
+    follow the stamped layout.
+
+.DESCRIPTION
+    Pure string helper for tests and for the newest-first sort in
+    Find-SqlCpyDatabaseBackupFile. Used to prefer the newest timestamp
+    baked into the filename itself over filesystem LastWriteTime when the
+    stamped layout is in use.
+
+.PARAMETER FileName
+    Filename only (not full path).
+
+.PARAMETER Database
+    Database name the stem must start with (case-insensitive) for the
+    timestamp to be returned.
+#>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [Parameter(Mandatory)] [AllowEmptyString()] [string]$FileName,
+        [Parameter(Mandatory)] [AllowEmptyString()] [string]$Database
+    )
+
+    if ([string]::IsNullOrWhiteSpace($FileName)) { return $null }
+    if ([string]::IsNullOrWhiteSpace($Database)) { return $null }
+
+    $stem = [System.IO.Path]::GetFileNameWithoutExtension($FileName)
+    if ([string]::IsNullOrEmpty($stem)) { return $null }
+
+    $db = $Database.Trim()
+    if ($stem.Length -le ($db.Length + 1)) { return $null }
+    $prefix = $stem.Substring(0, $db.Length)
+    if (-not [string]::Equals($prefix, $db, [StringComparison]::OrdinalIgnoreCase)) { return $null }
+    if ($stem[$db.Length] -ne ' ') { return $null }
+
+    $rest = $stem.Substring($db.Length + 1)
+    if ($rest -notmatch '^(\d{8})\s+(\d{4})$') { return $null }
+
+    $datePart = $Matches[1]
+    $timePart = $Matches[2]
+    $parsed = [datetime]::MinValue
+    $fmt = 'yyyyMMdd HHmm'
+    $culture = [System.Globalization.CultureInfo]::InvariantCulture
+    $ok = [datetime]::TryParseExact(
+        ("{0} {1}" -f $datePart, $timePart),
+        $fmt,
+        $culture,
+        [System.Globalization.DateTimeStyles]::AssumeLocal,
+        [ref]$parsed)
+    if (-not $ok) { return $null }
+    return $parsed
 }
 
 function Find-SqlCpyDatabaseBackupFile {
@@ -208,7 +273,32 @@ function Find-SqlCpyDatabaseBackupFile {
         $matched += $f
     }
 
-    return @($matched | Sort-Object -Property LastWriteTime -Descending)
+    # Prefer the newest timestamp baked into the filename when present
+    # (FULL share layout is "<db> yyyyMMdd HHmm.bak"). Fall back to
+    # LastWriteTime for entries whose name does not carry a stamp. Use an
+    # ordering key that is stable across both cases: (stampedTicks,
+    # lastWriteTicks). Stamp-less files get stampedTicks = 0 so any
+    # stamped file sorts ahead of them, which matches user intent to
+    # prefer explicit timestamps over filesystem mtime.
+    $decorated = foreach ($f in $matched) {
+        $stamp = Get-SqlCpyRestoreBackupTimestamp -FileName $f.Name -Database $Database
+        $stampTicks = if ($stamp) { $stamp.Ticks } else { 0L }
+        $mtimeTicks = 0L
+        if ($f.PSObject.Properties['LastWriteTime'] -and $f.LastWriteTime) {
+            try { $mtimeTicks = ([datetime]$f.LastWriteTime).Ticks } catch { $mtimeTicks = 0L }
+        }
+        [pscustomobject]@{
+            File       = $f
+            StampTicks = [long]$stampTicks
+            MtimeTicks = [long]$mtimeTicks
+        }
+    }
+
+    return @(
+        $decorated |
+            Sort-Object -Property StampTicks, MtimeTicks -Descending |
+            ForEach-Object { $_.File }
+    )
 }
 
 function Invoke-SqlCpyDatabaseRestore {
@@ -339,7 +429,7 @@ function Invoke-SqlCpyDatabaseRestore {
 
         if ($DryRun) {
             $stampText = if ($chosenStamp) { $chosenStamp.ToString('yyyy-MM-dd HH:mm:ss') } else { 'unknown timestamp' }
-            Write-SqlCpyInfo ("DRYRUN would restore {0} <- {1} ({2})" -f $db, $chosenPath, $stampText)
+            Write-SqlCpyInfo ("DRYRUN would restore {0} from {1} as {0} ({2})" -f $db, $chosenPath, $stampText)
             continue
         }
 

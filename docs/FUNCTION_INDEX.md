@@ -293,11 +293,22 @@ consumes them.
   returns candidate backup files for one database, newest first. Accepts
   either a real path (uses `Get-ChildItem`) or, via `-CandidateFiles`,
   an in-memory collection for unit tests. Filters by extension, optional
-  filename glob, and database-name matching.
+  filename glob, and database-name matching. Sort key prefers the
+  timestamp parsed out of the filename (yyyyMMdd HHmm FULL-share layout)
+  and falls back to `LastWriteTime` for stamp-less entries; a stamped
+  file always sorts ahead of a stamp-less one.
 - **`Test-SqlCpyRestoreFileMatchesDatabase`** — Pure string helper. Returns
-  `$true` when the filename stem equals the database name or starts with
-  `<db>_`, `<db>-`, or `<db>.` (case-insensitive). Avoids false positives
-  like `mydb2.bak` matching database `mydb`. Unit-tested.
+  `$true` when the filename stem equals the database name, starts with
+  `<db>_`, `<db>-`, or `<db>.`, OR matches the timestamped FULL-share
+  layout `<db> <yyyyMMdd> <HHmm>.bak` (case-insensitive). Avoids false
+  positives like `mydb2.bak` or `mydb2 20260420 0633.bak` matching
+  database `mydb`. Unit-tested.
+- **`Get-SqlCpyRestoreBackupTimestamp`** — Pure string helper. Parses
+  the trailing `<yyyyMMdd> <HHmm>` in a stamped backup filename and
+  returns the resulting `[datetime]`, or `$null` if the filename does
+  not follow the stamped FULL-share layout. Used by
+  `Find-SqlCpyDatabaseBackupFile` for the "newest by filename stamp"
+  sort. Unit-tested.
 
 ## Planned (not in this scaffold)
 
