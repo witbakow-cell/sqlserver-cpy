@@ -395,3 +395,111 @@ Caveats
 
 - Logging is to the screen only by default. If persistent logs are
   desired, add a Start-Transcript at the top of Start-SqlServerCopy.ps1.
+
+================================================================================
+Restore-based database move (NEW - alternative to schema-only)
+================================================================================
+
+Why this action exists
+----------------------
+The schema-only database copy (action 7, Invoke-SqlCpySchemaOnlyDatabaseCopy)
+has proven unreliable in several places: individual tables in the Tables phase
+can hang SMO indefinitely, the 14_FullTextCatalogs phase trips over missing
+server features, and the full SMO .Script() call has been observed to throw
+intermittently. The schema-only path is still shipped - it is useful when you
+genuinely only want the empty object model - but it cannot be the only way to
+move a database.
+
+The restore action (action R, Invoke-SqlCpyDatabaseRestore) is a second,
+independent path that avoids SMO entirely on the move itself. Another process
+drops FULL backups onto a shared UNC path, and this tool restores them on the
+target using dbatools Restore-DbaDatabase. No source SQL connection is needed
+for the move.
+
+Default UNC path: \\chbbopa2\CHBBBID2-backup$\FULL
+(configurable via DatabaseRestoreBackupPath in config/default.psd1 or local.psd1)
+
+Key design decisions
+--------------------
+- DATA IS MOVED. This is intentional and is the whole point of the action. The
+  schema-only path is for "I just want the object model"; the restore path is
+  for "I want a working, populated database on the target". This is called out
+  in the menu label and every log line.
+
+- Backup creation is OUT OF SCOPE. sqlserver-cpy does not create backups. Some
+  other process (SQL Agent job, maintenance plan, Ola Hallengren script, etc.)
+  is expected to fill the share. We just consume what's there.
+
+- Missing backup is NOT fatal. For each selected database the tool:
+    1. lists files at the configured path;
+    2. filters by extension (.bak, .backup by default) and by name match;
+    3. if nothing matches, logs
+         WARN backup not found for database <X> in path <Y>; skipping
+       and moves on to the next database.
+  Reasoning: a realistic batch will have some databases with a recent backup
+  and some without, and the user wants the ones that do have a backup to
+  still get moved.
+
+- Name matching is strict. The filename stem must equal the database name or
+  start with <db>_ / <db>- / <db>. . This avoids false positives like
+  "mydb2.bak" matching database "mydb". See
+  Test-SqlCpyRestoreFileMatchesDatabase in DatabaseRestore.ps1 for the rule.
+  If another process uses a wildly different naming convention, either
+  rename files on the share or set DatabaseRestoreFilePattern to narrow the
+  matcher further.
+
+- FULL backups only. The default extension list is .bak and .backup.
+  Transaction logs (.trn) are deliberately NOT picked up because there is no
+  log-chain replay in this action. If you need point-in-time recovery, do it
+  outside this tool.
+
+- Picks the newest matching file. When several candidates match, the
+  LastWriteTime-descending sort picks the most recent one. This matches the
+  expected share layout where each full backup lands with a date stamp.
+
+- WithReplace = $true by default. A move operation where the target already
+  has an older copy of the database should overwrite. Flip in local.psd1 if
+  that is undesirable.
+
+- Restore-DbaDatabase runs against the target connection object built by
+  Get-SqlCpyCachedConnection, so TrustServerCertificate / EncryptConnection
+  / ConnectionTimeout apply consistently with the rest of the module. Source
+  server is not contacted.
+
+- File relocation is delegated. By default Restore-DbaDatabase places data
+  and log files under the target server's default data / log directories.
+  Override with DatabaseRestoreDataFileDirectory /
+  DatabaseRestoreLogFileDirectory only if those defaults are unsuitable.
+  Full per-logical-file remapping is deliberately NOT implemented - it would
+  be premature given the stated move use case.
+
+- Backup header sanity check. When Read-DbaBackupHeader is available, the
+  tool reads the header and warns (but continues) if the backup's embedded
+  DatabaseName differs from the one the user asked to restore. Restore-
+  DbaDatabase -DatabaseName overrides the embedded name, so this is a warning
+  rather than an error, but it is worth surfacing.
+
+- Failure of one database does not stop the batch. Per-database failures are
+  logged as ERROR lines and the loop continues with the next database,
+  matching the same "do what you can, log what you can't" behaviour as the
+  missing-backup case.
+
+Caveats specific to the restore action
+--------------------------------------
+- The SQL Server service account on the target must be able to read the
+  backup files. Restore-DbaDatabase passes the UNC path to the server; the
+  server opens the file directly. If the service account cannot reach the
+  share, the restore fails with an OS-level error.
+
+- Disk pressure on the target. A schema-only copy consumes megabytes; a
+  restore consumes whatever the full database takes. Verify free space on
+  the target data / log volumes before running for a large batch.
+
+- Security surface. The restore action overwrites existing databases on the
+  target by default. Users and permissions baked into the backup are
+  restored verbatim. Review login mappings after the restore completes
+  (dbatools Repair-DbaDbOrphanUser is useful here).
+
+- No log-chain replay. Only the single newest FULL backup per database is
+  applied. If you need differentials or log backups replayed on top,
+  implement that outside this action or extend Invoke-SqlCpyDatabaseRestore.

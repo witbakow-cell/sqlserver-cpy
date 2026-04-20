@@ -1079,6 +1079,217 @@ try {
 }
 
 Write-Host ''
+Write-Host 'Checking DatabaseRestore config defaults and backup-matching helpers...' -ForegroundColor Cyan
+try {
+    # default.psd1 must declare the restore keys and the default UNC path.
+    $cfgForRestore = Import-PowerShellDataFile -Path $cfgPath
+    $restoreKeys = @(
+        'DatabaseRestoreBackupPath'
+        'DatabaseRestoreList'
+        'DatabaseRestoreFileExtensions'
+        'DatabaseRestoreFilePattern'
+        'DatabaseRestoreWithReplace'
+        'DatabaseRestoreNoRecovery'
+        'DatabaseRestoreTimeoutSeconds'
+        'DatabaseRestoreDataFileDirectory'
+        'DatabaseRestoreLogFileDirectory'
+    )
+    foreach ($k in $restoreKeys) {
+        if (-not $cfgForRestore.ContainsKey($k)) {
+            $failures += [pscustomobject]@{
+                File   = $cfgPath
+                Errors = "Missing restore config key: $k"
+            }
+        } else {
+            Write-Host "  OK  key '$k' declared"
+        }
+    }
+
+    $expectedUnc = '\\chbbopa2\CHBBBID2-backup$\FULL'
+    if ($cfgForRestore.DatabaseRestoreBackupPath -ne $expectedUnc) {
+        $failures += [pscustomobject]@{
+            File   = $cfgPath
+            Errors = "DatabaseRestoreBackupPath = '$($cfgForRestore.DatabaseRestoreBackupPath)'; expected '$expectedUnc'"
+        }
+    } else {
+        Write-Host "  OK  DatabaseRestoreBackupPath = $expectedUnc"
+    }
+
+    if (-not $cfgForRestore.Areas.ContainsKey('DatabaseRestore')) {
+        $failures += [pscustomobject]@{
+            File   = $cfgPath
+            Errors = "Areas missing DatabaseRestore flag"
+        }
+    } else {
+        Write-Host "  OK  Areas.DatabaseRestore = $($cfgForRestore.Areas.DatabaseRestore)"
+    }
+
+    # Manifest must export the restore functions.
+    if ($manifest) {
+        $restoreExports = @(
+            'Invoke-SqlCpyDatabaseRestore'
+            'Get-SqlCpyDatabaseRestoreConfig'
+            'Find-SqlCpyDatabaseBackupFile'
+            'Test-SqlCpyRestoreFileMatchesDatabase'
+        )
+        foreach ($fn in $restoreExports) {
+            if ($manifest.FunctionsToExport -notcontains $fn) {
+                $failures += [pscustomobject]@{
+                    File   = $manifestPath
+                    Errors = "FunctionsToExport missing: $fn"
+                }
+            } else {
+                Write-Host "  OK  exports $fn"
+            }
+        }
+    }
+
+    # Dot-source DatabaseRestore.ps1 in isolation and exercise the pure helpers.
+    $restoreFile = Join-Path -Path $repoRoot -ChildPath 'src/SqlServerCpy/Public/DatabaseRestore.ps1'
+    function Write-SqlCpyStep    { param($Message) Write-Host "[stub STEP] $Message" }
+    function Write-SqlCpyInfo    { param($Message) Write-Host "[stub INFO] $Message" }
+    function Write-SqlCpyWarning { param($Message) Write-Host "[stub WARN] $Message" }
+    function Write-SqlCpyError   { param($Message) Write-Host "[stub ERR ] $Message" }
+    . $restoreFile
+
+    # Get-SqlCpyDatabaseRestoreConfig defaults when called with $null.
+    $rcNull = Get-SqlCpyDatabaseRestoreConfig -Config $null
+    if ($rcNull.BackupPath -ne $expectedUnc) {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "Get-SqlCpyDatabaseRestoreConfig default BackupPath = '$($rcNull.BackupPath)'; expected '$expectedUnc'"
+        }
+    } else {
+        Write-Host "  OK  Get-SqlCpyDatabaseRestoreConfig(null) default BackupPath"
+    }
+    if (-not $rcNull.WithReplace) {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "Get-SqlCpyDatabaseRestoreConfig default WithReplace should be `$true"
+        }
+    } else {
+        Write-Host "  OK  Get-SqlCpyDatabaseRestoreConfig(null) default WithReplace"
+    }
+
+    # Test-SqlCpyRestoreFileMatchesDatabase: known positive / negative cases.
+    $matchCases = @(
+        @{ File = 'mydb.bak';                    Db = 'mydb';    Expected = $true  }
+        @{ File = 'MYDB.BAK';                    Db = 'mydb';    Expected = $true  }
+        @{ File = 'mydb_FULL_20240101.bak';      Db = 'mydb';    Expected = $true  }
+        @{ File = 'mydb-2024-01-01.bak';         Db = 'mydb';    Expected = $true  }
+        @{ File = 'mydb.2024-01-01.bak';         Db = 'mydb';    Expected = $true  }
+        @{ File = 'mydb2.bak';                   Db = 'mydb';    Expected = $false }
+        @{ File = 'otherdb.bak';                 Db = 'mydb';    Expected = $false }
+        @{ File = 'mydb_FULL.trn';               Db = 'mydb';    Expected = $true  }
+        @{ File = '';                            Db = 'mydb';    Expected = $false }
+        @{ File = 'mydb.bak';                    Db = '';        Expected = $false }
+        @{ File = 'dwcontrol_backup_full.bak';   Db = 'dwcontrol'; Expected = $true }
+    )
+    foreach ($c in $matchCases) {
+        $got = Test-SqlCpyRestoreFileMatchesDatabase -FileName $c.File -Database $c.Db
+        if ($got -ne $c.Expected) {
+            $failures += [pscustomobject]@{
+                File   = $restoreFile
+                Errors = "Test-SqlCpyRestoreFileMatchesDatabase('{0}','{1}') = {2}, expected {3}" -f $c.File, $c.Db, $got, $c.Expected
+            }
+        } else {
+            Write-Host ("  OK  Test-SqlCpyRestoreFileMatchesDatabase('{0}','{1}') = {2}" -f $c.File, $c.Db, $got)
+        }
+    }
+
+    # Find-SqlCpyDatabaseBackupFile: candidate-based filter + newest-first sort.
+    $mkCandidate = {
+        param($n, $t)
+        [pscustomobject]@{
+            Name          = $n
+            FullName      = "X:\stub\$n"
+            LastWriteTime = [datetime]$t
+        }
+    }
+    $candidates = @(
+        & $mkCandidate 'mydb_FULL_20240101.bak'          '2024-01-01 00:00:00'
+        & $mkCandidate 'mydb_FULL_20240201.bak'          '2024-02-01 00:00:00'
+        & $mkCandidate 'MYDB.Backup'                     '2024-03-01 00:00:00'
+        & $mkCandidate 'otherdb_FULL_20240401.bak'       '2024-04-01 00:00:00'
+        & $mkCandidate 'mydb_FULL_20231215.trn'          '2023-12-15 00:00:00'   # log, wrong ext for defaults
+        & $mkCandidate 'mydb2.bak'                       '2024-05-01 00:00:00'   # name mismatch
+        & $mkCandidate 'readme.txt'                      '2024-05-01 00:00:00'   # wrong ext
+    )
+    $found = Find-SqlCpyDatabaseBackupFile `
+        -BackupPath 'X:\stub' `
+        -Database   'mydb' `
+        -FileExtensions @('.bak', '.backup') `
+        -CandidateFiles $candidates
+    if (-not $found -or $found.Count -ne 3) {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "Find-SqlCpyDatabaseBackupFile: expected 3 matches for 'mydb'; got $($found.Count)"
+        }
+    } else {
+        Write-Host "  OK  Find-SqlCpyDatabaseBackupFile matched 3 candidates for 'mydb'"
+    }
+    if ($found -and $found[0].Name -ne 'MYDB.Backup') {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "Find-SqlCpyDatabaseBackupFile: newest-first sort broken; got '$($found[0].Name)', expected 'MYDB.Backup'"
+        }
+    } else {
+        Write-Host "  OK  Find-SqlCpyDatabaseBackupFile newest-first sort"
+    }
+
+    # Nothing matches -> empty, which models the 'backup not found' case.
+    $none = Find-SqlCpyDatabaseBackupFile `
+        -BackupPath 'X:\stub' `
+        -Database   'nosuchdb' `
+        -FileExtensions @('.bak', '.backup') `
+        -CandidateFiles $candidates
+    if ($none -and $none.Count -gt 0) {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "Find-SqlCpyDatabaseBackupFile: expected 0 matches for 'nosuchdb'; got $($none.Count)"
+        }
+    } else {
+        Write-Host "  OK  Find-SqlCpyDatabaseBackupFile returned empty for missing db"
+    }
+
+    # Extensions without leading dot should still work (normalization).
+    $normCfg = @{
+        DatabaseRestoreFileExtensions = @('bak','BACKUP')
+    }
+    $rcNorm = Get-SqlCpyDatabaseRestoreConfig -Config $normCfg
+    if ($rcNorm.FileExtensions -notcontains '.bak' -or $rcNorm.FileExtensions -notcontains '.backup') {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "Get-SqlCpyDatabaseRestoreConfig did not normalize extensions: $($rcNorm.FileExtensions -join ',')"
+        }
+    } else {
+        Write-Host "  OK  Get-SqlCpyDatabaseRestoreConfig normalizes extensions to lowercase with leading dot"
+    }
+
+    # FilePattern filter narrows matches.
+    $pattFound = Find-SqlCpyDatabaseBackupFile `
+        -BackupPath 'X:\stub' `
+        -Database   'mydb' `
+        -FileExtensions @('.bak', '.backup') `
+        -FilePattern '*FULL*' `
+        -CandidateFiles $candidates
+    # MYDB.Backup does not contain FULL in its name, so should be filtered out.
+    if ($pattFound.Count -ne 2) {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "Find-SqlCpyDatabaseBackupFile with FilePattern '*FULL*' should keep 2 entries for 'mydb'; got $($pattFound.Count)"
+        }
+    } else {
+        Write-Host "  OK  Find-SqlCpyDatabaseBackupFile respects FilePattern"
+    }
+} catch {
+    $failures += [pscustomobject]@{
+        File   = 'DatabaseRestore tests'
+        Errors = $_.Exception.Message
+    }
+}
+
+Write-Host ''
 if ($failures.Count -eq 0) {
     Write-Host 'All syntax and config checks passed.' -ForegroundColor Green
     exit 0

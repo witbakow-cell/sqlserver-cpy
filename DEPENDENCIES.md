@@ -154,3 +154,27 @@ without connection objects) still work and still take an optional
 If you find a `dbatools` cmdlet that exposes a timeout under yet another name, add it
 to the `Candidates` list inside `Get-SqlCpyConnectionSplat` (`src/SqlServerCpy/Public/Connection.ps1`)
 and it will be routed automatically.
+
+## Restore-based database move
+
+The new restore action (see README section "Restore-based database move")
+reads backup files from a UNC share and calls `Restore-DbaDatabase` on the
+target SQL Server. In addition to the general dependencies above it needs:
+
+- Read access from the account running the script to the configured UNC path.
+  The default is `\\chbbopa2\CHBBBID2-backup$\FULL`. No special SMB tuning is
+  required beyond whatever is needed to list files and stream a backup.
+- `Restore-DbaDatabase` from `dbatools` (already listed above). Optional
+  cmdlets that improve diagnostics when present: `Read-DbaBackupHeader`,
+  `Get-DbaBackupInformation`.
+- Ability for the target SQL Server service account to read the backup file.
+  `Restore-DbaDatabase` passes the path to the server, so the file is opened
+  by the SQL service, not by the PowerShell session. If the target SQL
+  service account cannot reach the share, the restore fails with an OS-level
+  "access denied" or "cannot find path". Either grant the service account
+  read permission on the share or have a separate process copy the backup
+  into a location the service account can reach and point
+  `DatabaseRestoreBackupPath` at that location in `config/local.psd1`.
+- Enough free disk space on the target's default (or overridden) data / log
+  directories for the **full** restored database - this action creates a
+  data-bearing database, unlike the schema-only copy.

@@ -51,6 +51,7 @@ function Start-SqlCpyInteractive {
         Write-Host '  5) Copy SSIS catalog (folders, projects, environments)'
         Write-Host '  6) Copy SSRS assets (reports, datasets, folders, roles, security, subscriptions)'
         Write-Host '  7) Copy selected databases (schema-only, no data)'
+        Write-Host '  R) Restore selected databases from backup share (FULL, includes data)'
         Write-Host '  8) Change source / target / DryRun'
         Write-Host '  9) Change connection security (Encrypt / TrustServerCertificate / Timeout)'
         Write-Host '  P) Preflight: test connectivity to source and target'
@@ -160,6 +161,31 @@ function Start-SqlCpyInteractive {
                 }
                 { $_ -match '^(?i)p$' } {
                     [void](Test-SqlCpyPreflight -Config $cfg)
+                }
+                { $_ -match '^(?i)r$' } {
+                    # Restore-from-backup action. Unlike the schema-only path, this
+                    # action RESTORES FULL DATABASES WITH DATA on the target from
+                    # files already present on the configured UNC share. It does
+                    # not talk to the source SQL Server and does not create
+                    # backups itself.
+                    $rc = Get-SqlCpyDatabaseRestoreConfig -Config $cfg
+                    Write-Host ('  Backup path: {0}' -f $rc.BackupPath) -ForegroundColor DarkGray
+
+                    $dbs = $null
+                    if ($cfg.ContainsKey('DatabaseRestoreList') -and $cfg.DatabaseRestoreList) {
+                        $dbs = @($cfg.DatabaseRestoreList)
+                    }
+                    if (-not $dbs -or $dbs.Count -eq 0) {
+                        $entered = Read-Host 'Databases to restore (comma-separated)'
+                        $dbs = $entered -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+                    }
+                    if (-not $dbs) { Write-SqlCpyWarning 'No databases specified.'; continue }
+
+                    Invoke-SqlCpyDatabaseRestore `
+                        -TargetServer $cfg.TargetServer `
+                        -Databases    $dbs `
+                        -DryRun       $cfg.DryRun `
+                        -Config       $cfg
                 }
                 '0' { return }
                 default { Write-SqlCpyWarning "Unknown choice: $choice" }

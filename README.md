@@ -413,6 +413,74 @@ schema-only copy finishes. `SchemaOnlyTableScriptTimeoutSeconds` has
   fires, the original SMO error is logged as a `WARN` line so the
   underlying SMO problem is still visible.
 
+## Restore-based database move (alternative to schema-only)
+
+The schema-only copy has proven unreliable in several places (see the Schema-only
+section above and `DECISIONS_AND_CAVEATS.txt`). A second, independent action is
+available for cases where you need a working copy of a database on the target
+and the schema-only path is not succeeding: **restore from a shared UNC backup
+path**.
+
+Key differences from the schema-only copy:
+
+| Aspect                     | Schema-only copy                          | Restore action (new)                            |
+|----------------------------|-------------------------------------------|-------------------------------------------------|
+| What ends up on the target | Empty objects, no data                    | **Full database WITH data**                     |
+| Contacts the source SQL    | Yes (uses SMO against the source)         | No - reads backup files on a share              |
+| Needs a backup             | No                                        | Yes (another process populates the share)       |
+| Failure mode               | Can hang on individual objects            | Missing backup per database is logged & skipped |
+
+### How it works
+
+1. Another process (not `sqlserver-cpy`) drops full database backups into a UNC
+   share. The default is `\\chbbopa2\CHBBBID2-backup$\FULL` (see
+   `DatabaseRestoreBackupPath` in `config/default.psd1`).
+2. You launch the TUI, select action **R) Restore selected databases from backup
+   share (FULL, includes data)**, and enter one or more database names.
+3. For each database the tool:
+   - lists files in the configured path;
+   - filters by extension (`.bak`, `.backup` by default) and by name match
+     (the stem must equal the database name or start with `<db>_`, `<db>-`,
+     or `<db>.`);
+   - picks the newest matching file;
+   - restores to the target using `Restore-DbaDatabase`.
+4. If no matching backup exists, the tool emits
+   `WARN backup not found for database <X> in path <Y>; skipping` and moves on -
+   a missing backup is **not** fatal.
+5. In `DryRun = $true` the tool logs what it would have restored without
+   touching the target.
+
+### Configuration keys
+
+```powershell
+DatabaseRestoreBackupPath        = '\\chbbopa2\CHBBBID2-backup$\FULL'
+DatabaseRestoreList              = @()                  # empty -> TUI prompts
+DatabaseRestoreFileExtensions    = @('.bak', '.backup') # FULL share; logs NOT picked up
+DatabaseRestoreFilePattern       = $null                # optional filename glob
+DatabaseRestoreWithReplace       = $true                # overwrite existing db on target
+DatabaseRestoreNoRecovery        = $false
+DatabaseRestoreTimeoutSeconds    = 0                    # 0 = no timeout
+DatabaseRestoreDataFileDirectory = $null                # $null -> target default
+DatabaseRestoreLogFileDirectory  = $null                # $null -> target default
+```
+
+### Caveats
+
+- **Data is moved.** This is intentional: the action exists precisely so that
+  the target ends up with a usable, data-bearing database. If you only want
+  the schema, use action `7` instead.
+- Only full backups are processed. Transaction logs and differential chains
+  are not replayed. If you need point-in-time recovery, do it outside this
+  tool.
+- If the backup's embedded database name differs from the one you asked to
+  restore, the tool logs a `WARN` and proceeds because `-DatabaseName`
+  overrides the backup's embedded name. Review the warning if you see it.
+- File relocation defaults to the target server's default data / log paths.
+  Override `DatabaseRestoreDataFileDirectory` / `DatabaseRestoreLogFileDirectory`
+  if the target's defaults are unsuitable.
+- The source SQL Server is not contacted. Source connection settings are
+  irrelevant for this action.
+
 ## Safety defaults
 
 The configuration file includes a `DryRun` flag (default `$true`). Destructive operations

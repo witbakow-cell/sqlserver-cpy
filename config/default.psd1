@@ -51,7 +51,62 @@
         SsisCatalog         = $true
         SsrsCatalog         = $true
         SchemaOnlyDatabases = $true
+        DatabaseRestore     = $true
     }
+
+    # -- Restore-from-backup action (separate from the schema-only copy) -----
+    #
+    # The restore-based database move is an ALTERNATIVE to the schema-only
+    # scripting task for cases where the latter has proven unreliable. It
+    # restores FULL databases (including DATA) on the target SQL Server from
+    # backup files that another process has already dropped onto a shared
+    # UNC path. sqlserver-cpy itself does NOT create backups.
+    #
+    # UNC path below is the default share the user specified. In PowerShell
+    # string form backslashes must be doubled; the resolved UNC path is
+    # \\chbbopa2\CHBBBID2-backup$\FULL .
+    DatabaseRestoreBackupPath = '\\chbbopa2\CHBBBID2-backup$\FULL'
+
+    # Databases to restore by default. Empty array = none; the TUI will prompt.
+    DatabaseRestoreList = @()
+
+    # Backup file matching.
+    #   DatabaseRestoreFileExtensions - accepted backup file extensions (case
+    #                                   insensitive, leading dot optional).
+    #                                   FULL backup share: default to .bak and
+    #                                   .backup; transaction logs are NOT
+    #                                   picked up because there is no log-chain
+    #                                   replay in this action.
+    #   DatabaseRestoreFilePattern    - optional glob applied to the filename
+    #                                   (not the full path) in addition to the
+    #                                   extension filter. $null = no extra
+    #                                   filter. Example: '*_FULL_*'.
+    DatabaseRestoreFileExtensions = @('.bak', '.backup')
+    DatabaseRestoreFilePattern    = $null
+
+    # Restore behaviour.
+    #   DatabaseRestoreWithReplace    - pass -WithReplace to Restore-DbaDatabase
+    #                                   so an existing database of the same name
+    #                                   on the target is overwritten. Documented
+    #                                   and INTENTIONAL for a move operation.
+    #   DatabaseRestoreNoRecovery     - leave the database in RESTORING state
+    #                                   after the restore (for adding further
+    #                                   log backups). Default $false = database
+    #                                   is brought online.
+    #   DatabaseRestoreTimeoutSeconds - per-database restore timeout; passed as
+    #                                   StatementTimeout to dbatools where the
+    #                                   cmdlet exposes it. 0 = no timeout.
+    DatabaseRestoreWithReplace    = $true
+    DatabaseRestoreNoRecovery     = $false
+    DatabaseRestoreTimeoutSeconds = 0
+
+    # File relocation on the target. $null = let Restore-DbaDatabase pick
+    # defaults (target server's default data/log paths). Override only if the
+    # target's default paths are unsuitable.
+    #   DatabaseRestoreDataFileDirectory - destination folder for .mdf/.ndf
+    #   DatabaseRestoreLogFileDirectory  - destination folder for .ldf
+    DatabaseRestoreDataFileDirectory = $null
+    DatabaseRestoreLogFileDirectory  = $null
 
     # Databases to copy as schema-only (no data). Empty array = none selected by default.
     SchemaOnlyDatabaseList = @()

@@ -269,6 +269,36 @@ commands (`Copy-DbaDbTableData`, BCP, `INSERT`s) are not invoked.
   an empty hashtable if `Invoke-DbaQuery` is unavailable or the query
   fails; callers log `object_id=-` in that case.
 
+## Database restore (from UNC backup share)
+
+All in `src/SqlServerCpy/Public/DatabaseRestore.ps1`. This is the
+restore-based alternative to the schema-only copy. Unlike that path, it
+moves FULL DATABASES WITH DATA to the target. Another process is expected
+to drop backup files onto the configured UNC share; this tool only
+consumes them.
+
+- **`Invoke-SqlCpyDatabaseRestore`** — Action entry point. For each
+  requested database, locates the newest matching full backup in
+  `DatabaseRestoreBackupPath` (default `\\chbbopa2\CHBBBID2-backup$\FULL`)
+  and calls `Restore-DbaDatabase` on the target. Missing backups log a
+  `WARN backup not found for database <X> in path <Y>; skipping` and the
+  loop continues. Honours `DryRun`. Does not contact the source SQL
+  Server.
+- **`Get-SqlCpyDatabaseRestoreConfig`** — Pure helper that normalises
+  restore-related config keys with defaults, including the default UNC
+  path, the default extension list (`.bak`, `.backup`), and the restore
+  flags (`WithReplace`, `NoRecovery`, timeout, data/log relocation).
+  Exercised directly in `tests/Syntax.Tests.ps1`.
+- **`Find-SqlCpyDatabaseBackupFile`** — Pure-enumeration helper that
+  returns candidate backup files for one database, newest first. Accepts
+  either a real path (uses `Get-ChildItem`) or, via `-CandidateFiles`,
+  an in-memory collection for unit tests. Filters by extension, optional
+  filename glob, and database-name matching.
+- **`Test-SqlCpyRestoreFileMatchesDatabase`** — Pure string helper. Returns
+  `$true` when the filename stem equals the database name or starts with
+  `<db>_`, `<db>-`, or `<db>.` (case-insensitive). Avoids false positives
+  like `mydb2.bak` matching database `mydb`. Unit-tested.
+
 ## Planned (not in this scaffold)
 
 - SSAS migration — see [`docs/SSAS_PLANNED.md`](SSAS_PLANNED.md).

@@ -64,6 +64,10 @@
         'Invoke-SqlCpyScriptObjectWithTimeout'
         'Resolve-SqlCpySchemaOnlyTableMode'
         'Get-SqlCpyDatabaseObjectIdMap'
+        'Invoke-SqlCpyDatabaseRestore'
+        'Get-SqlCpyDatabaseRestoreConfig'
+        'Find-SqlCpyDatabaseBackupFile'
+        'Test-SqlCpyRestoreFileMatchesDatabase'
     )
     CmdletsToExport   = @()
     VariablesToExport = @()
