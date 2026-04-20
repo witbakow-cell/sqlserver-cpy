@@ -446,6 +446,11 @@ Key differences from the schema-only copy:
    - picks the newest matching file (newest timestamp baked into the
      filename wins when the stamped layout is used; otherwise newest
      `LastWriteTime`);
+   - if `DatabaseRestoreUseLocalStaging = $true` (default), copies the
+     selected backup from the UNC share to
+     `DatabaseRestoreLocalStagingPath` using the current PowerShell
+     user's credentials, then points the restore at that local copy
+     (see "Local staging" below);
    - restores to the target using `Restore-DbaDatabase` with
      `-DatabaseName` pinned to the clean requested name (`mPurchasing`),
      NOT the filename stem or the backup header's embedded name.
@@ -474,7 +479,57 @@ DatabaseRestoreDataFileDirectory = $null                # $null -> target defaul
 DatabaseRestoreLogFileDirectory  = $null                # $null -> target default
 DatabaseRestoreLogCandidateLimit = 50                   # cap of preview lines when enumerating
 DatabaseRestoreNameAliases       = @{}                  # e.g. @{ timesheet = 'mTimesheet' }
+
+# Local-staging (copy-then-restore) — workaround for the SQL Server
+# service account not being able to read a hidden UNC share:
+DatabaseRestoreUseLocalStaging     = $true
+DatabaseRestoreLocalStagingPath    = 'C:\Program Files\Microsoft SQL Server\MSSQL16.MSSQLSERVER\MSSQL\Backup'
+DatabaseRestoreOverwriteStagedFile = $true
+DatabaseRestoreCleanupLocalStaging = $false
 ```
+
+### Local staging (copy-then-restore)
+
+`Restore-DbaDatabase` and `Read-DbaBackupHeader` hand the RESTORE source
+path to the target SQL Server itself, which means the **SQL Server service
+account** reads the backup file — not the interactive PowerShell user. On
+a hidden UNC share like `\\chbbopa2\CHBBBID2-backup$\FULL` this produces:
+
+```
+[Read-DbaBackupHeader] File \\chbbopa2\CHBBBID2-backup$\FULL\mTimesheet 20260420 0633.bak
+does not exist or access denied. The SQL Server service account may not
+have access to the source directory.
+```
+
+even when `Test-Path` from your own PowerShell session succeeds — you have
+Kerberos access, the service account does not.
+
+**Workaround (enabled by default):** copy the selected backup from the UNC
+share to a local folder on the target server, then restore from that
+local copy. The copy runs as the current PowerShell user (who already has
+UNC access), and the restore runs as the SQL service account against a
+local path that it can always read. The default staging directory is the
+SQL Server 2022 default Backup folder for the `MSSQLSERVER` instance:
+
+```
+C:\Program Files\Microsoft SQL Server\MSSQL16.MSSQLSERVER\MSSQL\Backup
+```
+
+Staging behaviour is controlled by four config keys:
+
+| Key                                 | Default | Meaning |
+|-------------------------------------|---------|---------|
+| `DatabaseRestoreUseLocalStaging`    | `$true` | Copy UNC backup to a local path before restoring. Set `$false` to restore directly from the UNC path (original behaviour). |
+| `DatabaseRestoreLocalStagingPath`   | `C:\Program Files\Microsoft SQL Server\MSSQL16.MSSQLSERVER\MSSQL\Backup` | Destination folder. Should be readable by the SQL Server service account. The default is the server's own Backup folder, which it can always read. |
+| `DatabaseRestoreOverwriteStagedFile` | `$true` | Overwrite an existing file at the staged path. If `$false` and the destination exists, the database is skipped. |
+| `DatabaseRestoreCleanupLocalStaging` | `$false` | Delete the staged file after a successful restore. Default `$false` because keeping the file is safer for review and retry. Failed restores never trigger cleanup. |
+
+The staging destination filename preserves the original backup filename
+unchanged, e.g. `mTimesheet 20260420 0633.bak`, so logs correlate with the
+UNC source. In `DryRun` mode the tool logs the intended copy and restore
+without moving any bytes. If the staging directory does not exist the tool
+attempts to create it; if creation fails (Program Files paths typically
+need admin), staging is disabled for that run and a clear error is logged.
 
 ### Strict matching and aliases
 

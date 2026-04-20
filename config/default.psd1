@@ -133,6 +133,58 @@
     # (the default) disables aliasing entirely.
     DatabaseRestoreNameAliases = @{}
 
+    # -- Local staging (copy-then-restore) -----------------------------------
+    #
+    # Restore-DbaDatabase / Read-DbaBackupHeader run the RESTORE on the target
+    # SQL Server, which means the SQL Server SERVICE ACCOUNT reads the backup
+    # path (not the current PowerShell user). A hidden UNC share like
+    # \\chbbopa2\CHBBBID2-backup$\FULL may be reachable from the interactive
+    # PowerShell session (admin Kerberos) but NOT from the SQL Server service
+    # account, producing:
+    #
+    #   [Read-DbaBackupHeader] File \\chbbopa2\CHBBBID2-backup$\FULL\<file>.bak
+    #   does not exist or access denied. The SQL Server service account may
+    #   not have access to the source directory.
+    #
+    # Workaround: copy the selected backup from the UNC share to a LOCAL path
+    # on the target server first (performed by sqlserver-cpy as the current
+    # PowerShell user, which already has UNC access), then point the restore
+    # at the local copy. SQL Server's own service account reads the local
+    # file, which is normally inside its own default Backup folder.
+    #
+    #   DatabaseRestoreUseLocalStaging      - $true enables copy-then-restore.
+    #                                         Default $true because the user's
+    #                                         restore target is localhost and
+    #                                         the SQL service account is the
+    #                                         well-known culprit here. Set to
+    #                                         $false to restore directly from
+    #                                         the UNC path (the original
+    #                                         behaviour).
+    #   DatabaseRestoreLocalStagingPath     - destination folder for the
+    #                                         copied backup. Default is
+    #                                         SQL Server 2022's default Backup
+    #                                         directory for MSSQLSERVER, which
+    #                                         the service account can always
+    #                                         read. Override if your target
+    #                                         uses a different instance
+    #                                         version or name.
+    #   DatabaseRestoreOverwriteStagedFile  - $true overwrites an existing
+    #                                         file at the staged path; $false
+    #                                         skips the copy (and restore) and
+    #                                         logs a WARN. Default $true: a
+    #                                         stale copy from a previous run
+    #                                         is not helpful.
+    #   DatabaseRestoreCleanupLocalStaging  - $false leaves the staged file in
+    #                                         place after a successful
+    #                                         restore (safer for review and
+    #                                         retry); $true deletes it. Copy
+    #                                         failures and failed restores
+    #                                         never trigger cleanup.
+    DatabaseRestoreUseLocalStaging     = $true
+    DatabaseRestoreLocalStagingPath    = 'C:\Program Files\Microsoft SQL Server\MSSQL16.MSSQLSERVER\MSSQL\Backup'
+    DatabaseRestoreOverwriteStagedFile = $true
+    DatabaseRestoreCleanupLocalStaging = $false
+
     # Databases to copy as schema-only (no data). Empty array = none selected by default.
     SchemaOnlyDatabaseList = @()
 

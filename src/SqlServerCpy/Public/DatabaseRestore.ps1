@@ -24,16 +24,20 @@ function Get-SqlCpyDatabaseRestoreConfig {
     )
 
     $resolved = @{
-        BackupPath         = '\\chbbopa2\CHBBBID2-backup$\FULL'
-        FileExtensions     = @('.bak', '.backup')
-        FilePattern        = $null
-        WithReplace        = $true
-        NoRecovery         = $false
-        TimeoutSeconds     = 0
-        DataFileDirectory  = $null
-        LogFileDirectory   = $null
-        LogCandidateLimit  = 50
-        NameAliases        = @{}
+        BackupPath           = '\\chbbopa2\CHBBBID2-backup$\FULL'
+        FileExtensions       = @('.bak', '.backup')
+        FilePattern          = $null
+        WithReplace          = $true
+        NoRecovery           = $false
+        TimeoutSeconds       = 0
+        DataFileDirectory    = $null
+        LogFileDirectory     = $null
+        LogCandidateLimit    = 50
+        NameAliases          = @{}
+        UseLocalStaging      = $true
+        LocalStagingPath     = 'C:\Program Files\Microsoft SQL Server\MSSQL16.MSSQLSERVER\MSSQL\Backup'
+        OverwriteStagedFile  = $true
+        CleanupLocalStaging  = $false
     }
 
     if ($Config) {
@@ -64,6 +68,18 @@ function Get-SqlCpyDatabaseRestoreConfig {
         if ($Config.ContainsKey('DatabaseRestoreLogCandidateLimit')) {
             $raw = $Config.DatabaseRestoreLogCandidateLimit
             if ($null -ne $raw) { $resolved.LogCandidateLimit = [int]$raw }
+        }
+        if ($Config.ContainsKey('DatabaseRestoreUseLocalStaging')) {
+            $resolved.UseLocalStaging = [bool]$Config.DatabaseRestoreUseLocalStaging
+        }
+        if ($Config.ContainsKey('DatabaseRestoreLocalStagingPath') -and $Config.DatabaseRestoreLocalStagingPath) {
+            $resolved.LocalStagingPath = [string]$Config.DatabaseRestoreLocalStagingPath
+        }
+        if ($Config.ContainsKey('DatabaseRestoreOverwriteStagedFile')) {
+            $resolved.OverwriteStagedFile = [bool]$Config.DatabaseRestoreOverwriteStagedFile
+        }
+        if ($Config.ContainsKey('DatabaseRestoreCleanupLocalStaging')) {
+            $resolved.CleanupLocalStaging = [bool]$Config.DatabaseRestoreCleanupLocalStaging
         }
         if ($Config.ContainsKey('DatabaseRestoreNameAliases') -and $Config.DatabaseRestoreNameAliases) {
             $aliasHash = @{}
@@ -136,6 +152,92 @@ function Resolve-SqlCpyRestoreDatabaseAlias {
         }
     }
     return $trimmed
+}
+
+function Get-SqlCpyRestoreStagingPlan {
+<#
+.SYNOPSIS
+    Builds a staging plan describing the local destination path for a backup
+    file that is about to be copied off a UNC share before the restore runs.
+
+.DESCRIPTION
+    Pure path-composition helper so it can be unit-tested without touching the
+    filesystem. Preserves the original backup filename (including extension
+    and any embedded timestamp, e.g. "mTimesheet 20260420 0633.bak") so the
+    staged copy is easy to correlate with its source on the share. Does NOT
+    check whether the staging folder exists - that is the caller's job, and
+    is a runtime concern (the default path lives under Program Files and may
+    require admin to create, though SQL Server's default Backup folder is
+    almost always present on a healthy install).
+
+    Returns a pscustomobject. The function never throws; callers should
+    inspect .IsValid and .Reason to decide what to do.
+
+.PARAMETER SourceFullName
+    Full path of the source backup file (usually on the UNC share).
+
+.PARAMETER SourceFileName
+    Bare filename of the source backup (used when SourceFullName is missing or
+    empty). Preserved verbatim as the staging destination filename.
+
+.PARAMETER StagingDirectory
+    Local directory to copy into. Should be readable by the SQL Server service
+    account on the target (the whole reason this workaround exists). Default
+    is the SQL Server 2022 default Backup folder for the MSSQLSERVER instance.
+
+.OUTPUTS
+    pscustomobject with properties:
+      IsValid       - $true only when all fields could be populated.
+      Reason        - short reason code: 'ok', 'no-filename',
+                      'no-staging-directory'.
+      SourcePath    - echo of SourceFullName (or SourceFileName if full path
+                      was empty).
+      SourceName    - bare filename extracted from the source.
+      Destination   - composed local path (Join-Path StagingDirectory
+                      SourceName) or $null when invalid.
+      StagingDir    - echo of StagingDirectory.
+#>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [AllowNull()] [AllowEmptyString()] [string]$SourceFullName,
+        [AllowNull()] [AllowEmptyString()] [string]$SourceFileName,
+        [AllowNull()] [AllowEmptyString()] [string]$StagingDirectory
+    )
+
+    $out = [pscustomobject]@{
+        IsValid     = $false
+        Reason      = 'no-filename'
+        SourcePath  = $SourceFullName
+        SourceName  = $null
+        Destination = $null
+        StagingDir  = $StagingDirectory
+    }
+
+    $name = $null
+    if (-not [string]::IsNullOrWhiteSpace($SourceFileName)) {
+        $name = [string]$SourceFileName
+    } elseif (-not [string]::IsNullOrWhiteSpace($SourceFullName)) {
+        try { $name = [System.IO.Path]::GetFileName([string]$SourceFullName) } catch { $name = $null }
+    }
+    if ([string]::IsNullOrWhiteSpace($name)) {
+        $out.Reason = 'no-filename'
+        return $out
+    }
+    $out.SourceName = $name
+    if ([string]::IsNullOrWhiteSpace($SourceFullName)) {
+        $out.SourcePath = $name
+    }
+
+    if ([string]::IsNullOrWhiteSpace($StagingDirectory)) {
+        $out.Reason = 'no-staging-directory'
+        return $out
+    }
+
+    $out.Destination = Join-Path -Path $StagingDirectory -ChildPath $name
+    $out.IsValid     = $true
+    $out.Reason      = 'ok'
+    return $out
 }
 
 function Test-SqlCpyRestoreFileMatchesDatabase {
@@ -557,11 +659,28 @@ function Invoke-SqlCpyDatabaseRestore {
          database name and the configured extensions. Pick the newest.
       2. If none found, emit a WARN line and skip; continue with the next
          database. Missing backups are NOT fatal.
-      3. If DryRun is set, log what WOULD be restored (database, file,
-         timestamp) and move on.
-      4. Otherwise invoke Restore-DbaDatabase with WithReplace /
-         NoRecovery / DestinationDataDirectory / DestinationLogDirectory /
+      3. If DryRun is set, log what WOULD be copied and restored (database,
+         source file, staging destination if enabled, timestamp) and move on.
+      4. If DatabaseRestoreUseLocalStaging is $true (default), copy the
+         selected backup to DatabaseRestoreLocalStagingPath using the current
+         PowerShell process identity. Then hand the LOCAL path to
+         Restore-DbaDatabase. This is the SQL-service-account workaround: on
+         a hidden UNC share like "\\host\foo-backup$\FULL" the interactive
+         shell may have Kerberos access while the SQL Server service account
+         does not, producing "File ... does not exist or access denied. The
+         SQL Server service account may not have access to the source
+         directory" from Read-DbaBackupHeader. Staging the file under the
+         server's default Backup folder sidesteps that without ACL changes.
+         A copy failure is non-fatal for the batch: the database is logged
+         and skipped, and the loop continues with the next.
+      5. Otherwise (staging disabled OR staging preflight failed) invoke
+         Restore-DbaDatabase directly against the UNC path.
+      6. Call Restore-DbaDatabase with WithReplace / NoRecovery /
+         DestinationDataDirectory / DestinationLogDirectory /
          StatementTimeout as configured.
+      7. If DatabaseRestoreCleanupLocalStaging is $true and the restore
+         succeeded, delete the staged copy. Failed restores never trigger
+         cleanup so the file is available for retry.
 
     Diagnostic logging:
       * The resolved UNC backup path is logged verbatim so the reader can
@@ -656,6 +775,44 @@ function Invoke-SqlCpyDatabaseRestore {
         Write-SqlCpyInfo ("Name aliases configured: {0}" -f ($aliasPairs -join '; '))
     } else {
         Write-SqlCpyInfo "Name aliases configured: <none>"
+    }
+
+    # Local-staging preflight. Copy-then-restore exists because the SQL Server
+    # service account reads the RESTORE source, not the interactive PowerShell
+    # user; a hidden UNC share (e.g. "\\host\foo-backup$\FULL") may be
+    # reachable via Kerberos from the shell but invisible to the service
+    # account. Staging to a local folder under the server's default Backup
+    # directory sidesteps that mismatch without reconfiguring ACLs.
+    $stagingReady = $false
+    if ($rc.UseLocalStaging) {
+        Write-SqlCpyInfo ("Local staging: ENABLED (copy-then-restore)")
+        Write-SqlCpyInfo ("Local staging path (raw): [{0}]" -f $rc.LocalStagingPath)
+        Write-SqlCpyInfo ("Local staging overwrite existing: {0}; cleanup after restore: {1}" -f $rc.OverwriteStagedFile, $rc.CleanupLocalStaging)
+        Write-SqlCpyInfo ("Local staging rationale: SQL Server service account reads the RESTORE source path, not the current PowerShell user. The staging folder should therefore be a local path the SQL Server service account can read (the server's default Backup directory is a safe pick).")
+        if ([string]::IsNullOrWhiteSpace($rc.LocalStagingPath)) {
+            Write-SqlCpyWarning ("Local staging enabled but DatabaseRestoreLocalStagingPath is empty; disabling staging for this run and falling back to direct UNC restore.")
+            $rc.UseLocalStaging = $false
+        } elseif (Test-Path -LiteralPath $rc.LocalStagingPath) {
+            Write-SqlCpyInfo ("Local staging Test-Path: OK")
+            $stagingReady = $true
+        } else {
+            Write-SqlCpyWarning ("Local staging Test-Path: MISSING for [{0}]; attempting to create (may require admin for Program Files paths)." -f $rc.LocalStagingPath)
+            if ($DryRun) {
+                Write-SqlCpyInfo ("DRYRUN would create staging directory [{0}]" -f $rc.LocalStagingPath)
+                $stagingReady = $true
+            } else {
+                try {
+                    New-Item -ItemType Directory -Path $rc.LocalStagingPath -Force -ErrorAction Stop | Out-Null
+                    Write-SqlCpyInfo ("Local staging directory created: [{0}]" -f $rc.LocalStagingPath)
+                    $stagingReady = $true
+                } catch {
+                    Write-SqlCpyError ("Failed to create local staging directory [{0}]: {1}. Staging disabled for this run; restore will use the UNC path directly and may fail under the SQL Server service account." -f $rc.LocalStagingPath, $_.Exception.Message)
+                    $rc.UseLocalStaging = $false
+                }
+            }
+        }
+    } else {
+        Write-SqlCpyInfo ("Local staging: DISABLED (restore will use the UNC path directly; ensure the SQL Server service account can read it)")
     }
 
     $pathReachable = Test-Path -LiteralPath $rc.BackupPath
@@ -816,15 +973,79 @@ function Invoke-SqlCpyDatabaseRestore {
             Write-SqlCpyInfo ("{0}: 1 candidate backup found; selected: {1}" -f $requested, $chosen.Name)
         }
 
+        # Decide whether we will restore from the UNC path directly or from a
+        # locally-staged copy. Staging is the SQL-service-account workaround
+        # documented at the top of the function.
+        $useStagingForThisDb = $rc.UseLocalStaging -and $stagingReady
+        $restorePath         = $chosenPath
+        $stagedCopyMade      = $false
+        $stagingPlan         = $null
+
+        if ($rc.UseLocalStaging -and -not $stagingReady -and -not $DryRun) {
+            Write-SqlCpyWarning ("{0}: local staging was requested but is not ready (see earlier warnings); falling back to direct UNC restore for this database. The restore may fail if the SQL Server service account cannot read [{1}]." -f $requested, $chosenPath)
+        }
+
+        if ($useStagingForThisDb) {
+            $chosenName = $null
+            if ($chosen.PSObject.Properties['Name']) { $chosenName = [string]$chosen.Name }
+            $stagingPlan = Get-SqlCpyRestoreStagingPlan -SourceFullName $chosenPath -SourceFileName $chosenName -StagingDirectory $rc.LocalStagingPath
+
+            if (-not $stagingPlan.IsValid) {
+                Write-SqlCpyWarning ("{0}: could not compose staging destination (reason={1}); falling back to direct UNC restore." -f $requested, $stagingPlan.Reason)
+                $useStagingForThisDb = $false
+            } else {
+                $sizeText = '<unknown>'
+                if ($chosen.PSObject.Properties['Length'] -and $chosen.Length) {
+                    try { $sizeText = '{0:N0} bytes' -f [long]$chosen.Length } catch { $sizeText = [string]$chosen.Length }
+                }
+                Write-SqlCpyInfo ("{0}: staging plan: copy '{1}' ({2}) -> '{3}' (overwrite={4})" -f $requested, $stagingPlan.SourcePath, $sizeText, $stagingPlan.Destination, $rc.OverwriteStagedFile)
+                $restorePath = $stagingPlan.Destination
+            }
+        }
+
         if ($DryRun) {
             $stampText = if ($chosenStamp) { $chosenStamp.ToString('yyyy-MM-dd HH:mm:ss') } else { 'unknown timestamp' }
-            Write-SqlCpyInfo ("DRYRUN would restore {0} from {1} as {0} ({2})" -f $requested, $chosenPath, $stampText)
+            if ($useStagingForThisDb -and $stagingPlan -and $stagingPlan.IsValid) {
+                Write-SqlCpyInfo ("DRYRUN would copy {0} -> {1} (no bytes moved in dry-run)" -f $stagingPlan.SourcePath, $stagingPlan.Destination)
+                Write-SqlCpyInfo ("DRYRUN would restore {0} from {1} as {0} ({2})" -f $requested, $stagingPlan.Destination, $stampText)
+                if ($rc.CleanupLocalStaging) {
+                    Write-SqlCpyInfo ("DRYRUN would delete staged file {0} after successful restore (cleanup enabled)" -f $stagingPlan.Destination)
+                } else {
+                    Write-SqlCpyInfo ("DRYRUN would retain staged file {0} after restore (cleanup disabled)" -f $stagingPlan.Destination)
+                }
+            } else {
+                Write-SqlCpyInfo ("DRYRUN would restore {0} from {1} as {0} ({2})" -f $requested, $chosenPath, $stampText)
+            }
             continue
+        }
+
+        # Real copy (only when staging is active and we are past the DryRun gate).
+        if ($useStagingForThisDb -and $stagingPlan -and $stagingPlan.IsValid) {
+            $dstExists = Test-Path -LiteralPath $stagingPlan.Destination
+            if ($dstExists -and -not $rc.OverwriteStagedFile) {
+                Write-SqlCpyWarning ("{0}: staged file already exists at [{1}] and DatabaseRestoreOverwriteStagedFile is `$false; skipping copy and skipping restore to avoid using a stale copy." -f $requested, $stagingPlan.Destination)
+                continue
+            }
+            try {
+                Write-SqlCpyInfo ("{0}: copying backup to staging as current PowerShell user (not the SQL Server service account)." -f $requested)
+                Copy-Item -LiteralPath $stagingPlan.SourcePath -Destination $stagingPlan.Destination -Force:([bool]$rc.OverwriteStagedFile) -ErrorAction Stop
+                $stagedCopyMade = $true
+                $copiedSize = $null
+                try { $copiedSize = (Get-Item -LiteralPath $stagingPlan.Destination -ErrorAction Stop).Length } catch { $copiedSize = $null }
+                if ($null -ne $copiedSize) {
+                    Write-SqlCpyInfo ("{0}: staging copy complete: {1} ({2:N0} bytes)" -f $requested, $stagingPlan.Destination, [long]$copiedSize)
+                } else {
+                    Write-SqlCpyInfo ("{0}: staging copy complete: {1}" -f $requested, $stagingPlan.Destination)
+                }
+            } catch {
+                Write-SqlCpyError ("{0}: staging copy FAILED ({1} -> {2}): {3}. Skipping restore for this database and continuing with the next." -f $requested, $stagingPlan.SourcePath, $stagingPlan.Destination, $_.Exception.Message)
+                continue
+            }
         }
 
         $restoreSplat = @{
             SqlInstance    = $tgtConn
-            Path           = $chosenPath
+            Path           = $restorePath
             DatabaseName   = $requested
             EnableException = $true
         }
@@ -840,10 +1061,13 @@ function Invoke-SqlCpyDatabaseRestore {
             if ($tn) { $restoreSplat[$tn] = [int]$rc.TimeoutSeconds }
         }
 
-        # Best-effort integrity / metadata check.
+        # Best-effort integrity / metadata check against whatever path is about
+        # to feed the restore. When staging is active this hits the local copy,
+        # which avoids the "does not exist or access denied" warning the SQL
+        # service account emits on hidden UNC shares.
         if (Get-Command -Name Read-DbaBackupHeader -ErrorAction SilentlyContinue) {
             try {
-                $hdr = Read-DbaBackupHeader -SqlInstance $tgtConn -Path $chosenPath -ErrorAction Stop | Select-Object -First 1
+                $hdr = Read-DbaBackupHeader -SqlInstance $tgtConn -Path $restorePath -ErrorAction Stop | Select-Object -First 1
                 if ($hdr -and $hdr.DatabaseName -and -not [string]::Equals([string]$hdr.DatabaseName, $requested, [StringComparison]::OrdinalIgnoreCase)) {
                     Write-SqlCpyWarning ("{0}: backup header reports DatabaseName='{1}' (different from requested). Proceeding with restore as '{0}' because -DatabaseName overrides the backup's embedded name." -f $requested, $hdr.DatabaseName)
                 }
@@ -852,14 +1076,32 @@ function Invoke-SqlCpyDatabaseRestore {
             }
         }
 
-        Write-SqlCpyInfo ("Restoring {0} <- {1}" -f $requested, $chosenPath)
+        Write-SqlCpyInfo ("Restoring {0} <- {1}" -f $requested, $restorePath)
+        $restoreOk = $false
         try {
             Restore-DbaDatabase @restoreSplat | Out-Null
             Write-SqlCpyInfo ("Restore complete: {0}" -f $requested)
+            $restoreOk = $true
         } catch {
             Write-SqlCpyError ("Restore failed for {0}: {1}" -f $requested, $_.Exception.Message)
             # Do not throw - continue with remaining databases, matching the
             # "missing backup is not fatal" spirit of this action.
+        }
+
+        # Cleanup: only delete the staged file when cleanup is enabled AND the
+        # restore actually succeeded. Keeping the file after a failed restore
+        # is deliberate so the user can inspect / retry without re-copying.
+        if ($stagedCopyMade -and $rc.CleanupLocalStaging) {
+            if ($restoreOk) {
+                try {
+                    Remove-Item -LiteralPath $stagingPlan.Destination -Force -ErrorAction Stop
+                    Write-SqlCpyInfo ("{0}: staged file deleted after successful restore: {1}" -f $requested, $stagingPlan.Destination)
+                } catch {
+                    Write-SqlCpyWarning ("{0}: staged file cleanup failed for [{1}]: {2}. Leaving file in place; continuing." -f $requested, $stagingPlan.Destination, $_.Exception.Message)
+                }
+            } else {
+                Write-SqlCpyWarning ("{0}: restore failed; leaving staged file [{1}] in place for inspection/retry regardless of DatabaseRestoreCleanupLocalStaging." -f $requested, $stagingPlan.Destination)
+            }
         }
     }
 }

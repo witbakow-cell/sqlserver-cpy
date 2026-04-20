@@ -1095,6 +1095,10 @@ try {
         'DatabaseRestoreLogFileDirectory'
         'DatabaseRestoreLogCandidateLimit'
         'DatabaseRestoreNameAliases'
+        'DatabaseRestoreUseLocalStaging'
+        'DatabaseRestoreLocalStagingPath'
+        'DatabaseRestoreOverwriteStagedFile'
+        'DatabaseRestoreCleanupLocalStaging'
     )
     foreach ($k in $restoreKeys) {
         if (-not $cfgForRestore.ContainsKey($k)) {
@@ -1136,6 +1140,7 @@ try {
             'Get-SqlCpyRestoreMatchReason'
             'Get-SqlCpyRestoreClosestCandidate'
             'Resolve-SqlCpyRestoreDatabaseAlias'
+            'Get-SqlCpyRestoreStagingPlan'
         )
         foreach ($fn in $restoreExports) {
             if ($manifest.FunctionsToExport -notcontains $fn) {
@@ -1705,6 +1710,249 @@ try {
 } catch {
     $failures += [pscustomobject]@{
         File   = 'DatabaseRestore diagnostics tests'
+        Errors = $_.Exception.Message
+    }
+}
+
+Write-Host ''
+Write-Host 'Checking DatabaseRestore local-staging config and staging-plan helper...' -ForegroundColor Cyan
+try {
+    $restoreFile = Join-Path -Path $repoRoot -ChildPath 'src/SqlServerCpy/Public/DatabaseRestore.ps1'
+    $defaultPsd1 = Join-Path -Path $repoRoot -ChildPath 'config/default.psd1'
+    $cfgForStaging = Import-PowerShellDataFile -Path $defaultPsd1
+
+    # Default config: staging on, default path under MSSQL16 Backup dir,
+    # overwrite on, cleanup off (safer for review/retry per user request).
+    if ($cfgForStaging.DatabaseRestoreUseLocalStaging -ne $true) {
+        $failures += [pscustomobject]@{
+            File   = $defaultPsd1
+            Errors = "DatabaseRestoreUseLocalStaging must default to `$true; got $($cfgForStaging.DatabaseRestoreUseLocalStaging)"
+        }
+    } else {
+        Write-Host "  OK  DatabaseRestoreUseLocalStaging default = `$true"
+    }
+    $expectedStagingPath = 'C:\Program Files\Microsoft SQL Server\MSSQL16.MSSQLSERVER\MSSQL\Backup'
+    if ($cfgForStaging.DatabaseRestoreLocalStagingPath -ne $expectedStagingPath) {
+        $failures += [pscustomobject]@{
+            File   = $defaultPsd1
+            Errors = "DatabaseRestoreLocalStagingPath = '$($cfgForStaging.DatabaseRestoreLocalStagingPath)'; expected '$expectedStagingPath'"
+        }
+    } else {
+        Write-Host "  OK  DatabaseRestoreLocalStagingPath = $expectedStagingPath"
+    }
+    if ($cfgForStaging.DatabaseRestoreOverwriteStagedFile -ne $true) {
+        $failures += [pscustomobject]@{
+            File   = $defaultPsd1
+            Errors = "DatabaseRestoreOverwriteStagedFile must default to `$true; got $($cfgForStaging.DatabaseRestoreOverwriteStagedFile)"
+        }
+    } else {
+        Write-Host "  OK  DatabaseRestoreOverwriteStagedFile default = `$true"
+    }
+    if ($cfgForStaging.DatabaseRestoreCleanupLocalStaging -ne $false) {
+        $failures += [pscustomobject]@{
+            File   = $defaultPsd1
+            Errors = "DatabaseRestoreCleanupLocalStaging must default to `$false (safer for review/retry); got $($cfgForStaging.DatabaseRestoreCleanupLocalStaging)"
+        }
+    } else {
+        Write-Host "  OK  DatabaseRestoreCleanupLocalStaging default = `$false"
+    }
+
+    # Re-dot-source the restore file in case previous blocks modified scope.
+    function Write-SqlCpyStep    { param($Message) Write-Host "[stub STEP] $Message" }
+    function Write-SqlCpyInfo    { param($Message) Write-Host "[stub INFO] $Message" }
+    function Write-SqlCpyWarning { param($Message) Write-Host "[stub WARN] $Message" }
+    function Write-SqlCpyError   { param($Message) Write-Host "[stub ERR ] $Message" }
+    . $restoreFile
+
+    # Get-SqlCpyDatabaseRestoreConfig threads the staging keys with the
+    # expected defaults when Config is $null.
+    $rcNullStaging = Get-SqlCpyDatabaseRestoreConfig -Config $null
+    if ($rcNullStaging.UseLocalStaging -ne $true) {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "Get-SqlCpyDatabaseRestoreConfig(null) UseLocalStaging should default to `$true; got $($rcNullStaging.UseLocalStaging)"
+        }
+    } else {
+        Write-Host "  OK  restore config default UseLocalStaging = `$true"
+    }
+    if ($rcNullStaging.LocalStagingPath -ne $expectedStagingPath) {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "Get-SqlCpyDatabaseRestoreConfig(null) LocalStagingPath should default to '$expectedStagingPath'; got '$($rcNullStaging.LocalStagingPath)'"
+        }
+    } else {
+        Write-Host "  OK  restore config default LocalStagingPath = $expectedStagingPath"
+    }
+    if ($rcNullStaging.OverwriteStagedFile -ne $true) {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "Get-SqlCpyDatabaseRestoreConfig(null) OverwriteStagedFile should default to `$true"
+        }
+    } else {
+        Write-Host "  OK  restore config default OverwriteStagedFile = `$true"
+    }
+    if ($rcNullStaging.CleanupLocalStaging -ne $false) {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "Get-SqlCpyDatabaseRestoreConfig(null) CleanupLocalStaging should default to `$false"
+        }
+    } else {
+        Write-Host "  OK  restore config default CleanupLocalStaging = `$false"
+    }
+
+    # Config overrides flow through.
+    $cfgOverride = @{
+        DatabaseRestoreUseLocalStaging     = $false
+        DatabaseRestoreLocalStagingPath    = 'D:\SqlStaging'
+        DatabaseRestoreOverwriteStagedFile = $false
+        DatabaseRestoreCleanupLocalStaging = $true
+    }
+    $rcOverride = Get-SqlCpyDatabaseRestoreConfig -Config $cfgOverride
+    if ($rcOverride.UseLocalStaging -ne $false -or $rcOverride.LocalStagingPath -ne 'D:\SqlStaging' -or $rcOverride.OverwriteStagedFile -ne $false -or $rcOverride.CleanupLocalStaging -ne $true) {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = ("Get-SqlCpyDatabaseRestoreConfig did not thread staging overrides; got Use={0}, Path={1}, Overwrite={2}, Cleanup={3}" -f $rcOverride.UseLocalStaging, $rcOverride.LocalStagingPath, $rcOverride.OverwriteStagedFile, $rcOverride.CleanupLocalStaging)
+        }
+    } else {
+        Write-Host "  OK  restore config threads staging overrides"
+    }
+
+    # Get-SqlCpyRestoreStagingPlan: happy path preserves the original filename
+    # verbatim in the destination. This is what lets "mTimesheet 20260420
+    # 0633.bak" show up unchanged under the staging directory so the log
+    # entries correlate with the UNC source.
+    $p1 = Get-SqlCpyRestoreStagingPlan `
+        -SourceFullName '\\chbbopa2\CHBBBID2-backup$\FULL\mTimesheet 20260420 0633.bak' `
+        -SourceFileName 'mTimesheet 20260420 0633.bak' `
+        -StagingDirectory 'C:\Program Files\Microsoft SQL Server\MSSQL16.MSSQLSERVER\MSSQL\Backup'
+    if (-not $p1.IsValid -or $p1.Reason -ne 'ok') {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "Get-SqlCpyRestoreStagingPlan happy path IsValid=$($p1.IsValid) Reason=$($p1.Reason)"
+        }
+    }
+    if ($p1.Destination -ne 'C:\Program Files\Microsoft SQL Server\MSSQL16.MSSQLSERVER\MSSQL\Backup\mTimesheet 20260420 0633.bak') {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "Get-SqlCpyRestoreStagingPlan must preserve the original filename; got destination '$($p1.Destination)'"
+        }
+    } else {
+        Write-Host "  OK  staging plan preserves 'mTimesheet 20260420 0633.bak' in destination path"
+    }
+    if ($p1.SourceName -ne 'mTimesheet 20260420 0633.bak') {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "Get-SqlCpyRestoreStagingPlan SourceName = '$($p1.SourceName)'; expected 'mTimesheet 20260420 0633.bak'"
+        }
+    } else {
+        Write-Host "  OK  staging plan SourceName = 'mTimesheet 20260420 0633.bak'"
+    }
+
+    # When SourceFileName is empty but SourceFullName is populated, the helper
+    # must derive the name from the full path so callers that only have the
+    # FullName (UNC) still get a usable plan.
+    $p2 = Get-SqlCpyRestoreStagingPlan `
+        -SourceFullName '\\host\share\mPurchasing 20260420 0633.bak' `
+        -SourceFileName '' `
+        -StagingDirectory 'C:\stage'
+    if (-not $p2.IsValid -or $p2.SourceName -ne 'mPurchasing 20260420 0633.bak' -or $p2.Destination -ne 'C:\stage\mPurchasing 20260420 0633.bak') {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "Get-SqlCpyRestoreStagingPlan should derive filename from SourceFullName when SourceFileName empty; got Name='$($p2.SourceName)' Dest='$($p2.Destination)'"
+        }
+    } else {
+        Write-Host "  OK  staging plan derives filename from SourceFullName"
+    }
+
+    # Empty filename -> invalid, reason 'no-filename', no destination.
+    $p3 = Get-SqlCpyRestoreStagingPlan -SourceFullName '' -SourceFileName '' -StagingDirectory 'C:\stage'
+    if ($p3.IsValid -or $p3.Reason -ne 'no-filename' -or $p3.Destination) {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "Get-SqlCpyRestoreStagingPlan should reject empty filename; got IsValid=$($p3.IsValid) Reason=$($p3.Reason) Dest='$($p3.Destination)'"
+        }
+    } else {
+        Write-Host "  OK  staging plan rejects empty filename"
+    }
+
+    # Empty staging directory -> invalid, reason 'no-staging-directory'.
+    $p4 = Get-SqlCpyRestoreStagingPlan `
+        -SourceFullName '\\host\share\mydb.bak' `
+        -SourceFileName 'mydb.bak' `
+        -StagingDirectory ''
+    if ($p4.IsValid -or $p4.Reason -ne 'no-staging-directory') {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "Get-SqlCpyRestoreStagingPlan should reject empty staging directory; got IsValid=$($p4.IsValid) Reason=$($p4.Reason)"
+        }
+    } else {
+        Write-Host "  OK  staging plan rejects empty staging directory"
+    }
+
+    # Whitespace-only filename should also be rejected.
+    $p5 = Get-SqlCpyRestoreStagingPlan -SourceFullName '   ' -SourceFileName '   ' -StagingDirectory 'C:\stage'
+    if ($p5.IsValid) {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = 'Get-SqlCpyRestoreStagingPlan should reject whitespace-only filename.'
+        }
+    } else {
+        Write-Host "  OK  staging plan rejects whitespace-only filename"
+    }
+
+    # Source inspection: Invoke-SqlCpyDatabaseRestore must log the staging
+    # rationale, honour DryRun (no copy), preserve the restore target name,
+    # and never cleanup on restore failure. Regex-level to keep the test
+    # PowerShell-free.
+    $restoreText = Get-Content -LiteralPath $restoreFile -Raw
+    $expectedSnippets = @(
+        'Local staging: ENABLED'
+        'Local staging: DISABLED'
+        'SQL Server service account'
+        'DRYRUN would copy'
+        'staging copy complete'
+        'staging copy FAILED'
+        'staged file deleted after successful restore'
+        'restore failed; leaving staged file'
+        'Get-SqlCpyRestoreStagingPlan'
+    )
+    foreach ($snip in $expectedSnippets) {
+        if ($restoreText -notmatch [regex]::Escape($snip)) {
+            $failures += [pscustomobject]@{
+                File   = $restoreFile
+                Errors = "Invoke-SqlCpyDatabaseRestore source must include staging-related snippet: '$snip'"
+            }
+        } else {
+            Write-Host ("  OK  restore source contains '{0}'" -f $snip)
+        }
+    }
+
+    # Manifest exports the new helper.
+    if ($manifest -and $manifest.FunctionsToExport -notcontains 'Get-SqlCpyRestoreStagingPlan') {
+        $failures += [pscustomobject]@{
+            File   = $manifestPath
+            Errors = 'FunctionsToExport missing: Get-SqlCpyRestoreStagingPlan'
+        }
+    } else {
+        Write-Host "  OK  manifest exports Get-SqlCpyRestoreStagingPlan"
+    }
+
+    # default.psd1 must document the four new keys so local.psd1 authors can
+    # discover them without reading code.
+    $defaultText = Get-Content -LiteralPath $defaultPsd1 -Raw
+    foreach ($k in 'DatabaseRestoreUseLocalStaging','DatabaseRestoreLocalStagingPath','DatabaseRestoreOverwriteStagedFile','DatabaseRestoreCleanupLocalStaging') {
+        if ($defaultText -notmatch [regex]::Escape($k)) {
+            $failures += [pscustomobject]@{
+                File   = $defaultPsd1
+                Errors = "config/default.psd1 must declare $k"
+            }
+        } else {
+            Write-Host "  OK  default config declares $k"
+        }
+    }
+} catch {
+    $failures += [pscustomobject]@{
+        File   = 'DatabaseRestore staging tests'
         Errors = $_.Exception.Message
     }
 }

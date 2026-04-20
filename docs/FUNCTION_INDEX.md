@@ -289,7 +289,19 @@ consumes them.
   reason, and a closest-candidate hint when nothing matched. Strict
   matching is retained; to accept a name that does not match the on-share
   stem, configure `DatabaseRestoreNameAliases` (e.g.
-  `@{ timesheet = 'mTimesheet' }`).
+  `@{ timesheet = 'mTimesheet' }`). When
+  `DatabaseRestoreUseLocalStaging = $true` (default), each selected
+  backup is copied to `DatabaseRestoreLocalStagingPath` as the current
+  PowerShell user before `Restore-DbaDatabase` runs, so the SQL Server
+  service account reads a LOCAL file instead of a hidden UNC share
+  (working around
+  `Read-DbaBackupHeader: File ... does not exist or access denied. The
+  SQL Server service account may not have access to the source
+  directory.`). Staging destination filename is preserved verbatim. A
+  failed copy for one database is non-fatal; the loop continues.
+  `DatabaseRestoreCleanupLocalStaging` controls whether the staged file
+  is removed after a successful restore; a failed restore never
+  triggers cleanup.
 - **`Get-SqlCpyDatabaseRestoreConfig`** — Pure helper that normalises
   restore-related config keys with defaults, including the default UNC
   path, the default extension list (`.bak`, `.backup`), the restore
@@ -337,6 +349,16 @@ consumes them.
   not follow the stamped FULL-share layout. Used by
   `Find-SqlCpyDatabaseBackupFile` for the "newest by filename stamp"
   sort. Unit-tested.
+- **`Get-SqlCpyRestoreStagingPlan`** — Pure path-composition helper for
+  copy-then-restore. Given a source backup path / filename and a local
+  staging directory, returns a pscustomobject with the destination
+  path (filename preserved verbatim so the staged copy correlates with
+  the UNC source) and a short reason code (`ok`, `no-filename`,
+  `no-staging-directory`). Never throws, never touches the filesystem;
+  callers use `.IsValid` to branch. Unit-tested. Used by
+  `Invoke-SqlCpyDatabaseRestore` when `DatabaseRestoreUseLocalStaging`
+  is `$true` to work around the SQL Server service account not being
+  able to read hidden UNC shares.
 
 ## Planned (not in this scaffold)
 

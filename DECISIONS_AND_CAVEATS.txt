@@ -593,3 +593,95 @@ UNC reachability, share permissions, the extension filter, the
 pattern filter, a typo, or a missing alias. The matcher was NOT
 loosened; the user chose strict matching and an explicit alias map as
 the recovery path.
+
+
+Local staging (copy-then-restore) for restore-from-UNC
+------------------------------------------------------
+Context: even when the interactive PowerShell session can reach the
+backup share without issue, the user hit
+
+  [Read-DbaBackupHeader] File \\chbbopa2\CHBBBID2-backup$\FULL\mTimesheet
+    20260420 0633.bak does not exist or access denied. The SQL Server
+    service account may not have access to the source directory.
+
+Root cause: Restore-DbaDatabase and Read-DbaBackupHeader hand the RESTORE
+source path to the target SQL Server, which opens the file as the SQL
+Server SERVICE ACCOUNT - not as the current PowerShell user. A hidden
+UNC share ("\\host\foo-backup$\FULL") may be granted to the interactive
+Kerberos principal but not to the server's service account, producing
+the warning above even while Test-Path and Get-ChildItem succeed in the
+same PowerShell session.
+
+Resolution: a copy-then-restore mode, enabled by default:
+
+  DatabaseRestoreUseLocalStaging     = $true
+  DatabaseRestoreLocalStagingPath    = 'C:\Program Files\Microsoft SQL Server\MSSQL16.MSSQLSERVER\MSSQL\Backup'
+  DatabaseRestoreOverwriteStagedFile = $true
+  DatabaseRestoreCleanupLocalStaging = $false
+
+For each selected backup, Invoke-SqlCpyDatabaseRestore now:
+
+  1. Matches the source file on the UNC share (existing behaviour).
+  2. If staging is enabled, copies that file to the staging directory
+     using Copy-Item in the current PowerShell process (i.e. as the
+     interactive user, who already has UNC access).
+  3. Points Restore-DbaDatabase / Read-DbaBackupHeader at the LOCAL
+     staged path. The SQL Server service account reads the local file,
+     which it can always do when the staging path is the server's own
+     Backup directory.
+  4. If DatabaseRestoreCleanupLocalStaging = $true, deletes the staged
+     file after a SUCCESSFUL restore. A failed restore never triggers
+     cleanup, so the user has the file available for inspection or
+     retry.
+
+Design decisions:
+
+- Default path is C:\Program Files\Microsoft SQL Server\
+  MSSQL16.MSSQLSERVER\MSSQL\Backup because that is the localhost default
+  backup folder for SQL Server 2022 MSSQLSERVER instances and the
+  service account has read+write to it by definition. Users on
+  different SQL versions or named instances override in local.psd1.
+
+- Default DatabaseRestoreCleanupLocalStaging = $false (keep the staged
+  file) because:
+    a) The user explicitly asked for "safer for review/retry".
+    b) The staging folder is the server's own Backup directory, so a
+       handful of stale .bak files there is benign, and the user can
+       reap them manually.
+    c) If the restore fails mid-way, the operator does not want the
+       tool to delete the source-of-truth-on-this-host before they can
+       look at it.
+
+- DryRun logs the copy and restore plan but moves no bytes. The
+  existing "DRYRUN would restore ..." line is kept so log grep tools do
+  not break; a new "DRYRUN would copy ..." line is added above it when
+  staging is active.
+
+- Staging directory creation is best-effort. Program Files paths
+  typically require admin to create; if New-Item fails the tool logs a
+  clear error and falls back to restoring directly from the UNC path
+  for that run (original behaviour). It does NOT try to silently
+  "helpfully" shove the file somewhere else.
+
+- Copy failure for one database does not stop the batch. The
+  per-database error is logged, the loop continues with the next
+  database, matching the existing "missing backup is not fatal" spirit.
+
+- Destination filename preserves the original backup filename
+  (including the embedded timestamp for stamped FULL-share layouts),
+  both for ease of log correlation and because the test suite asserts
+  it. Pure-string composition lives in Get-SqlCpyRestoreStagingPlan so
+  it can be unit-tested without the filesystem or SQL Server.
+
+- DatabaseRestoreOverwriteStagedFile = $true by default. A stale staged
+  file from a previous run is more likely to mislead than help; the
+  safer behaviour is to replace it with the current UNC source. Set to
+  $false only if you are deliberately using the staging folder as a
+  cache and want the tool to skip databases whose staged file already
+  exists.
+
+- Staging is a workaround, not a replacement. It does NOT grant the
+  service account read access on the UNC share; it just avoids needing
+  that grant. If the correct fix is to give the SQL Server service
+  account read access to the hidden share, do that and set
+  DatabaseRestoreUseLocalStaging = $false in local.psd1.

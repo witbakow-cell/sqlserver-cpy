@@ -72,6 +72,7 @@
         'Get-SqlCpyRestoreClosestCandidate'
         'Resolve-SqlCpyRestoreDatabaseAlias'
         'Get-SqlCpyRestoreBackupTimestamp'
+        'Get-SqlCpyRestoreStagingPlan'
     )
     CmdletsToExport   = @()
     VariablesToExport = @()
