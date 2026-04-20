@@ -240,6 +240,261 @@ function Get-SqlCpyRestoreStagingPlan {
     return $out
 }
 
+function Format-SqlCpyByteSize {
+<#
+.SYNOPSIS
+    Formats a byte count as a human-readable string (B, KB, MB, GB, TB).
+
+.DESCRIPTION
+    Pure helper used by disk-space diagnostic logging. Returns '<unknown>'
+    for $null or negative input so callers can pass through values without
+    checking. Uses binary prefixes (1024) to match Windows' own disk-space
+    display so the log lines agree with what the user sees in Explorer.
+
+.PARAMETER Bytes
+    Byte count. Accepts [long]/[int]/[double]; $null and negatives map to
+    '<unknown>'.
+
+.OUTPUTS
+    [string]
+#>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowNull()] [object]$Bytes
+    )
+
+    if ($null -eq $Bytes) { return '<unknown>' }
+    $n = 0.0
+    try { $n = [double]$Bytes } catch { return '<unknown>' }
+    if ($n -lt 0) { return '<unknown>' }
+    if ($n -lt 1024) { return ('{0:N0} B' -f $n) }
+
+    $units = @('KB','MB','GB','TB','PB')
+    $i = -1
+    $v = $n
+    while ($v -ge 1024 -and $i -lt ($units.Length - 1)) {
+        $v = $v / 1024.0
+        $i++
+    }
+    return ('{0:N2} {1}' -f $v, $units[$i])
+}
+
+function Get-SqlCpyRestoreStagingFreeSpace {
+<#
+.SYNOPSIS
+    Returns available free-space information for the drive or root that
+    backs a local staging path.
+
+.DESCRIPTION
+    Pure-ish helper: resolves the drive/root from a staging path (does not
+    require the full path to exist, only the root) and queries free space
+    using .NET System.IO.DriveInfo. Designed to be safe to call before the
+    staging directory is created.
+
+    Missing or unparseable paths, unmapped drives and unexpected errors
+    are surfaced via .IsAvailable = $false plus a short .Reason code; the
+    helper never throws so the caller can log a warning and continue.
+
+    Reason codes:
+      ok                    free-space query succeeded
+      empty-path            input path was null/whitespace
+      no-root               [System.IO.Path]::GetPathRoot returned empty
+      unc-path              path is a UNC (\\host\share\...) - DriveInfo
+                            cannot report free space for UNC roots in a
+                            portable way from PowerShell, so treat as
+                            unsupported rather than guess
+      drive-not-found       DriveInfo could not locate a matching drive
+      drive-not-ready       DriveInfo found the drive but IsReady is $false
+                            (removable media etc.)
+      error                 unexpected exception (see .Error)
+
+.PARAMETER Path
+    Local path under which files will be staged. Does not need to exist.
+
+.OUTPUTS
+    pscustomobject with properties:
+      IsAvailable      - $true only when FreeBytes could be read.
+      Reason           - short reason code (see above).
+      Path             - echo of the input path.
+      Root             - resolved drive root, or $null.
+      FreeBytes        - available free space in bytes (long), or $null.
+      TotalBytes       - total size in bytes (long), or $null.
+      FreeDisplay      - Format-SqlCpyByteSize(FreeBytes).
+      TotalDisplay     - Format-SqlCpyByteSize(TotalBytes).
+      Error            - exception message when Reason='error'.
+#>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [AllowNull()] [AllowEmptyString()] [string]$Path
+    )
+
+    $out = [pscustomobject]@{
+        IsAvailable  = $false
+        Reason       = 'empty-path'
+        Path         = $Path
+        Root         = $null
+        FreeBytes    = $null
+        TotalBytes   = $null
+        FreeDisplay  = '<unknown>'
+        TotalDisplay = '<unknown>'
+        Error        = $null
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $out }
+
+    $root = $null
+    try { $root = [System.IO.Path]::GetPathRoot([string]$Path) } catch { $root = $null }
+    if ([string]::IsNullOrWhiteSpace($root)) {
+        $out.Reason = 'no-root'
+        return $out
+    }
+    $out.Root = $root
+
+    # UNC paths have roots like "\\host\share" - DriveInfo cannot query these
+    # portably. Report unsupported rather than fabricate a reading.
+    if ($root.StartsWith('\\') -or $root.StartsWith('//')) {
+        $out.Reason = 'unc-path'
+        return $out
+    }
+
+    try {
+        $di = [System.IO.DriveInfo]::new($root)
+        if (-not $di) {
+            $out.Reason = 'drive-not-found'
+            return $out
+        }
+        if (-not $di.IsReady) {
+            $out.Reason = 'drive-not-ready'
+            return $out
+        }
+        $out.FreeBytes    = [long]$di.AvailableFreeSpace
+        $out.TotalBytes   = [long]$di.TotalSize
+        $out.FreeDisplay  = Format-SqlCpyByteSize -Bytes $out.FreeBytes
+        $out.TotalDisplay = Format-SqlCpyByteSize -Bytes $out.TotalBytes
+        $out.IsAvailable  = $true
+        $out.Reason       = 'ok'
+    } catch {
+        $out.Reason = 'error'
+        $out.Error  = $_.Exception.Message
+    }
+
+    return $out
+}
+
+function Test-SqlCpyRestoreStagingDiskSpace {
+<#
+.SYNOPSIS
+    Decides whether enough free space exists on the staging drive to copy a
+    backup file, accounting for an existing same-path file that will be
+    overwritten.
+
+.DESCRIPTION
+    Pure arithmetic helper so the disk-space precheck is unit-testable
+    without SQL Server, without a real filesystem, and without DriveInfo.
+    Inputs are raw byte counts; nothing is read from disk.
+
+    Decision rule:
+      effectiveNeeded = max(0, BackupBytes - (ExistingStagedBytes if
+                       OverwriteEnabled else 0))
+      HasEnoughSpace  = FreeBytes >= effectiveNeeded
+
+    Reclaiming the existing staged file is a conservative simplification:
+    in practice Copy-Item -Force deletes-then-writes, so the free-space
+    delta during the copy can dip below this figure momentarily. For the
+    precheck that is acceptable - the goal is to avoid launching a copy
+    into a drive that cannot possibly fit the source, not to model every
+    filesystem intermediate state.
+
+    When BackupBytes is $null, unknown, or non-positive, returns
+    HasEnoughSpace=$true with Reason='unknown-size' so the caller can
+    continue (attempting the copy and letting it fail is preferable to
+    skipping a restore over a missing size).
+
+.PARAMETER BackupBytes
+    Size of the source backup file in bytes.
+
+.PARAMETER FreeBytes
+    Free space reported for the staging drive.
+
+.PARAMETER ExistingStagedBytes
+    Size of a file already at the staging destination, if any (0 or $null
+    when none).
+
+.PARAMETER OverwriteEnabled
+    Mirrors DatabaseRestoreOverwriteStagedFile. Only when $true do we
+    reclaim ExistingStagedBytes from the needed figure.
+
+.OUTPUTS
+    pscustomobject:
+      HasEnoughSpace  [bool]
+      Reason          ok | insufficient | unknown-size | missing-free
+      NeededBytes     effective bytes needed (long)
+      NeededDisplay   human-readable
+      FreeBytes       echo
+      FreeDisplay     human-readable
+      BackupBytes     echo
+      ReclaimBytes    bytes reclaimed from overwriting existing staged file
+#>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [AllowNull()] [object]$BackupBytes,
+        [AllowNull()] [object]$FreeBytes,
+        [AllowNull()] [object]$ExistingStagedBytes,
+        [bool]$OverwriteEnabled = $false
+    )
+
+    $backup    = $null
+    $free      = $null
+    $existing  = 0L
+    try { if ($null -ne $BackupBytes)         { $backup   = [long]$BackupBytes } }         catch { $backup = $null }
+    try { if ($null -ne $FreeBytes)           { $free     = [long]$FreeBytes }   }         catch { $free = $null }
+    try { if ($null -ne $ExistingStagedBytes) { $existing = [long]$ExistingStagedBytes } } catch { $existing = 0L }
+    if ($existing -lt 0) { $existing = 0L }
+
+    $reclaim = if ($OverwriteEnabled) { $existing } else { 0L }
+
+    $out = [pscustomobject]@{
+        HasEnoughSpace = $true
+        Reason         = 'ok'
+        NeededBytes    = 0L
+        NeededDisplay  = '<unknown>'
+        FreeBytes      = $free
+        FreeDisplay    = (Format-SqlCpyByteSize -Bytes $free)
+        BackupBytes    = $backup
+        ReclaimBytes   = [long]$reclaim
+    }
+
+    if ($null -eq $backup -or $backup -le 0) {
+        $out.Reason        = 'unknown-size'
+        $out.NeededBytes   = 0L
+        $out.NeededDisplay = '<unknown>'
+        return $out
+    }
+
+    $needed = $backup - $reclaim
+    if ($needed -lt 0) { $needed = 0L }
+    $out.NeededBytes   = [long]$needed
+    $out.NeededDisplay = Format-SqlCpyByteSize -Bytes $needed
+
+    if ($null -eq $free) {
+        $out.HasEnoughSpace = $true
+        $out.Reason         = 'missing-free'
+        return $out
+    }
+
+    if ($free -ge $needed) {
+        $out.HasEnoughSpace = $true
+        $out.Reason         = 'ok'
+    } else {
+        $out.HasEnoughSpace = $false
+        $out.Reason         = 'insufficient'
+    }
+    return $out
+}
+
 function Test-SqlCpyRestoreFileMatchesDatabase {
 <#
 .SYNOPSIS
@@ -994,11 +1249,54 @@ function Invoke-SqlCpyDatabaseRestore {
                 Write-SqlCpyWarning ("{0}: could not compose staging destination (reason={1}); falling back to direct UNC restore." -f $requested, $stagingPlan.Reason)
                 $useStagingForThisDb = $false
             } else {
-                $sizeText = '<unknown>'
+                $backupBytes = $null
                 if ($chosen.PSObject.Properties['Length'] -and $chosen.Length) {
-                    try { $sizeText = '{0:N0} bytes' -f [long]$chosen.Length } catch { $sizeText = [string]$chosen.Length }
+                    try { $backupBytes = [long]$chosen.Length } catch { $backupBytes = $null }
                 }
-                Write-SqlCpyInfo ("{0}: staging plan: copy '{1}' ({2}) -> '{3}' (overwrite={4})" -f $requested, $stagingPlan.SourcePath, $sizeText, $stagingPlan.Destination, $rc.OverwriteStagedFile)
+                $backupBytesText = if ($null -ne $backupBytes) { '{0:N0} bytes' -f $backupBytes } else { '<unknown>' }
+                $backupSizeText  = Format-SqlCpyByteSize -Bytes $backupBytes
+                Write-SqlCpyInfo ("{0}: staging plan: copy '{1}' ({2} / {3}) -> '{4}' (overwrite={5})" -f $requested, $stagingPlan.SourcePath, $backupSizeText, $backupBytesText, $stagingPlan.Destination, $rc.OverwriteStagedFile)
+
+                # Disk-space precheck. If the staging drive cannot fit the
+                # selected backup, skip this database rather than fail mid-copy
+                # and leave a truncated .bak on the server.
+                $freeInfo = Get-SqlCpyRestoreStagingFreeSpace -Path $rc.LocalStagingPath
+                if ($freeInfo.IsAvailable) {
+                    Write-SqlCpyInfo ("{0}: staging drive [{1}] free space: {2} ({3:N0} bytes) of total {4}" -f $requested, $freeInfo.Root, $freeInfo.FreeDisplay, $freeInfo.FreeBytes, $freeInfo.TotalDisplay)
+                } else {
+                    Write-SqlCpyWarning ("{0}: could not read free space for staging path [{1}] (reason={2}{3}); proceeding without a disk-space guarantee." -f $requested, $rc.LocalStagingPath, $freeInfo.Reason, $(if ($freeInfo.Error) { '; ' + $freeInfo.Error } else { '' }))
+                }
+
+                $existingBytes = 0L
+                try {
+                    if (Test-Path -LiteralPath $stagingPlan.Destination) {
+                        $existingItem = Get-Item -LiteralPath $stagingPlan.Destination -ErrorAction Stop
+                        if ($existingItem.PSObject.Properties['Length'] -and $existingItem.Length) {
+                            $existingBytes = [long]$existingItem.Length
+                            Write-SqlCpyInfo ("{0}: existing staged file at destination: {1} ({2:N0} bytes); overwrite={3}" -f $requested, (Format-SqlCpyByteSize -Bytes $existingBytes), $existingBytes, $rc.OverwriteStagedFile)
+                        }
+                    }
+                } catch {
+                    Write-SqlCpyWarning ("{0}: could not stat existing staged file at [{1}]: {2}; ignoring for space calc." -f $requested, $stagingPlan.Destination, $_.Exception.Message)
+                    $existingBytes = 0L
+                }
+
+                $spaceCheck = Test-SqlCpyRestoreStagingDiskSpace -BackupBytes $backupBytes -FreeBytes $freeInfo.FreeBytes -ExistingStagedBytes $existingBytes -OverwriteEnabled:$rc.OverwriteStagedFile
+
+                $skipForSpace = $false
+                if ($spaceCheck.Reason -eq 'ok') {
+                    Write-SqlCpyInfo ("{0}: disk-space check OK: need {1} ({2:N0} bytes) after reclaiming existing {3:N0} bytes; free {4} ({5:N0} bytes) on [{6}]" -f $requested, $spaceCheck.NeededDisplay, $spaceCheck.NeededBytes, $spaceCheck.ReclaimBytes, $spaceCheck.FreeDisplay, $spaceCheck.FreeBytes, $freeInfo.Root)
+                } elseif ($spaceCheck.Reason -eq 'unknown-size') {
+                    Write-SqlCpyWarning ("{0}: disk-space check skipped (backup size unknown); will attempt copy without a precheck." -f $requested)
+                } elseif ($spaceCheck.Reason -eq 'missing-free') {
+                    Write-SqlCpyWarning ("{0}: disk-space check incomplete (free-space reading unavailable for [{1}]); will attempt copy without a guarantee." -f $requested, $rc.LocalStagingPath)
+                } elseif ($spaceCheck.Reason -eq 'insufficient') {
+                    Write-SqlCpyWarning ("{0}: INSUFFICIENT DISK SPACE on staging drive [{1}]: backup is {2} ({3:N0} bytes), need {4} ({5:N0} bytes) after reclaiming existing {6:N0} bytes, but only {7} ({8:N0} bytes) free. Skipping this database." -f $requested, $freeInfo.Root, $backupSizeText, $backupBytes, $spaceCheck.NeededDisplay, $spaceCheck.NeededBytes, $spaceCheck.ReclaimBytes, $spaceCheck.FreeDisplay, $spaceCheck.FreeBytes)
+                    $skipForSpace = $true
+                }
+
+                if ($skipForSpace) { continue }
+
                 $restorePath = $stagingPlan.Destination
             }
         }

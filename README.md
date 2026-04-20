@@ -531,6 +531,47 @@ without moving any bytes. If the staging directory does not exist the tool
 attempts to create it; if creation fails (Program Files paths typically
 need admin), staging is disabled for that run and a clear error is logged.
 
+#### Disk-space precheck
+
+Before copying each backup to the staging directory the tool reads the free
+space on the staging drive and compares it to the backup file size. Both
+values are logged in human-readable form and in raw bytes, together with
+the total disk size, so the user can confirm the numbers at a glance:
+
+```
+db: staging drive [C:\] free space: 12.34 GB (13,250,000,000 bytes) of total 256.00 GB
+db: staging plan: copy '\\host\share\db.bak' (2.10 GB / 2,254,857,600 bytes) -> 'C:\...\db.bak' (overwrite=True)
+db: disk-space check OK: need 2.10 GB (2,254,857,600 bytes) after reclaiming existing 0 bytes; free 12.34 GB on [C:\]
+```
+
+If the staging drive cannot fit the selected backup, the tool emits a
+`WARN` line of the form:
+
+```
+db: INSUFFICIENT DISK SPACE on staging drive [C:\]: backup is 2.10 GB
+(2,254,857,600 bytes), need 2.10 GB after reclaiming existing 0 bytes,
+but only 1.00 GB (1,073,741,824 bytes) free. Skipping this database.
+```
+
+…and skips to the next database. The loop continues, so one
+oversized backup does not block the rest of the batch. The same precheck
+runs in `DryRun` so you can see whether a planned restore would succeed
+without moving any bytes.
+
+When `DatabaseRestoreOverwriteStagedFile = $true` and an existing staged
+file is already on disk, its size is subtracted from the needed figure
+(the overwrite reclaims its bytes), so re-staging the same or a smaller
+backup over an existing copy does not spuriously flag
+insufficient-space. The model is intentionally simple: it does not try
+to track the transient delete-then-write that `Copy-Item -Force`
+performs. For the precheck this is acceptable — the goal is to avoid
+launching a copy into a drive that cannot possibly fit the source, not
+to model every filesystem intermediate state.
+
+UNC staging paths cannot be queried portably for free space, so the
+precheck logs a warning and proceeds without a guarantee rather than
+guessing. Missing backup-file sizes are treated the same way.
+
 ### Strict matching and aliases
 
 The matcher is deliberately strict: a request for `timesheet` will **not**

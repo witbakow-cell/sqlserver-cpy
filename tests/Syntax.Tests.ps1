@@ -1958,6 +1958,166 @@ try {
 }
 
 Write-Host ''
+Write-Host 'Checking DatabaseRestore disk-space precheck helpers...' -ForegroundColor Cyan
+try {
+    $restoreFile = Join-Path -Path $repoRoot -ChildPath 'src/SqlServerCpy/Public/DatabaseRestore.ps1'
+    function Write-SqlCpyStep    { param($Message) Write-Host "[stub STEP] $Message" }
+    function Write-SqlCpyInfo    { param($Message) Write-Host "[stub INFO] $Message" }
+    function Write-SqlCpyWarning { param($Message) Write-Host "[stub WARN] $Message" }
+    function Write-SqlCpyError   { param($Message) Write-Host "[stub ERR ] $Message" }
+    . $restoreFile
+
+    # Format-SqlCpyByteSize: unit boundaries and degenerate inputs.
+    $fmtCases = @(
+        @{ In = $null;        Expected = '<unknown>' }
+        @{ In = -1;           Expected = '<unknown>' }
+        @{ In = 0;            Expected = '0 B'       }
+        @{ In = 512;          Expected = '512 B'     }
+        @{ In = 1024;         Expected = '1.00 KB'   }
+        @{ In = 1048576;      Expected = '1.00 MB'   }
+        @{ In = 1073741824;   Expected = '1.00 GB'   }
+    )
+    foreach ($c in $fmtCases) {
+        $got = Format-SqlCpyByteSize -Bytes $c.In
+        if ($got -ne $c.Expected) {
+            $failures += [pscustomobject]@{
+                File   = $restoreFile
+                Errors = "Format-SqlCpyByteSize($($c.In)) = '$got'; expected '$($c.Expected)'"
+            }
+        } else {
+            Write-Host ("  OK  Format-SqlCpyByteSize({0}) -> {1}" -f $c.In, $got)
+        }
+    }
+
+    # Get-SqlCpyRestoreStagingFreeSpace: empty path returns empty-path.
+    $fsEmpty = Get-SqlCpyRestoreStagingFreeSpace -Path ''
+    if ($fsEmpty.IsAvailable -or $fsEmpty.Reason -ne 'empty-path') {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "Get-SqlCpyRestoreStagingFreeSpace('') should report empty-path; got $($fsEmpty.Reason) IsAvailable=$($fsEmpty.IsAvailable)"
+        }
+    } else {
+        Write-Host "  OK  free-space reports empty-path for blank input"
+    }
+
+    # UNC path is declared unsupported (does not crash, returns unc-path).
+    $fsUnc = Get-SqlCpyRestoreStagingFreeSpace -Path '\\chbbopa2\CHBBBID2-backup$\FULL'
+    if ($fsUnc.IsAvailable -or $fsUnc.Reason -ne 'unc-path') {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "Get-SqlCpyRestoreStagingFreeSpace(UNC) should report unc-path; got $($fsUnc.Reason) IsAvailable=$($fsUnc.IsAvailable)"
+        }
+    } else {
+        Write-Host "  OK  free-space reports unc-path for UNC input"
+    }
+
+    # Test-SqlCpyRestoreStagingDiskSpace: enough space, no existing file.
+    $sp1 = Test-SqlCpyRestoreStagingDiskSpace -BackupBytes 1000 -FreeBytes 5000 -ExistingStagedBytes 0 -OverwriteEnabled:$false
+    if (-not $sp1.HasEnoughSpace -or $sp1.Reason -ne 'ok' -or $sp1.NeededBytes -ne 1000) {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "disk-space(1000,5000) should be ok; got HasEnough=$($sp1.HasEnoughSpace) Reason=$($sp1.Reason) Needed=$($sp1.NeededBytes)"
+        }
+    } else {
+        Write-Host "  OK  disk-space ok when free >= backup"
+    }
+
+    # Insufficient space - skip the DB.
+    $sp2 = Test-SqlCpyRestoreStagingDiskSpace -BackupBytes 10000 -FreeBytes 1000 -ExistingStagedBytes 0 -OverwriteEnabled:$false
+    if ($sp2.HasEnoughSpace -or $sp2.Reason -ne 'insufficient' -or $sp2.NeededBytes -ne 10000) {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "disk-space(10000,1000) should be insufficient; got HasEnough=$($sp2.HasEnoughSpace) Reason=$($sp2.Reason) Needed=$($sp2.NeededBytes)"
+        }
+    } else {
+        Write-Host "  OK  disk-space flags insufficient when free < backup"
+    }
+
+    # Overwrite reclaim: existing 10000 bytes + overwrite means needed=0 and
+    # we should NOT flag insufficient even when free < raw backup size.
+    $sp3 = Test-SqlCpyRestoreStagingDiskSpace -BackupBytes 10000 -FreeBytes 100 -ExistingStagedBytes 10000 -OverwriteEnabled:$true
+    if (-not $sp3.HasEnoughSpace -or $sp3.Reason -ne 'ok' -or $sp3.NeededBytes -ne 0 -or $sp3.ReclaimBytes -ne 10000) {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "disk-space reclaim (overwrite same-size) should be ok with Needed=0 Reclaim=10000; got HasEnough=$($sp3.HasEnoughSpace) Reason=$($sp3.Reason) Needed=$($sp3.NeededBytes) Reclaim=$($sp3.ReclaimBytes)"
+        }
+    } else {
+        Write-Host "  OK  disk-space reclaims overwritten existing file"
+    }
+
+    # Overwrite disabled: reclaim must be 0 regardless of existing file.
+    $sp4 = Test-SqlCpyRestoreStagingDiskSpace -BackupBytes 10000 -FreeBytes 100 -ExistingStagedBytes 10000 -OverwriteEnabled:$false
+    if ($sp4.HasEnoughSpace -or $sp4.ReclaimBytes -ne 0) {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "disk-space with overwrite disabled must NOT reclaim existing bytes; got HasEnough=$($sp4.HasEnoughSpace) Reclaim=$($sp4.ReclaimBytes)"
+        }
+    } else {
+        Write-Host "  OK  disk-space does not reclaim when overwrite disabled"
+    }
+
+    # Unknown backup size -> unknown-size, HasEnoughSpace=true (don't skip).
+    $sp5 = Test-SqlCpyRestoreStagingDiskSpace -BackupBytes $null -FreeBytes 100 -ExistingStagedBytes 0 -OverwriteEnabled:$true
+    if (-not $sp5.HasEnoughSpace -or $sp5.Reason -ne 'unknown-size') {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "disk-space with null backup should be unknown-size/HasEnough=true; got $($sp5.Reason)/$($sp5.HasEnoughSpace)"
+        }
+    } else {
+        Write-Host "  OK  disk-space skips check when backup size unknown"
+    }
+
+    # Missing free-space reading -> missing-free, HasEnoughSpace=true.
+    $sp6 = Test-SqlCpyRestoreStagingDiskSpace -BackupBytes 1000 -FreeBytes $null -ExistingStagedBytes 0 -OverwriteEnabled:$false
+    if (-not $sp6.HasEnoughSpace -or $sp6.Reason -ne 'missing-free') {
+        $failures += [pscustomobject]@{
+            File   = $restoreFile
+            Errors = "disk-space with null free should be missing-free/HasEnough=true; got $($sp6.Reason)/$($sp6.HasEnoughSpace)"
+        }
+    } else {
+        Write-Host "  OK  disk-space tolerates missing free-space reading"
+    }
+
+    # Source-level assertion: Invoke-SqlCpyDatabaseRestore integrates the
+    # precheck and emits the expected diagnostic phrasing.
+    $restoreText = Get-Content -LiteralPath $restoreFile -Raw
+    $spaceSnippets = @(
+        'disk-space check OK'
+        'INSUFFICIENT DISK SPACE'
+        'Get-SqlCpyRestoreStagingFreeSpace'
+        'Test-SqlCpyRestoreStagingDiskSpace'
+        'Format-SqlCpyByteSize'
+    )
+    foreach ($snip in $spaceSnippets) {
+        if ($restoreText -notmatch [regex]::Escape($snip)) {
+            $failures += [pscustomobject]@{
+                File   = $restoreFile
+                Errors = "Invoke-SqlCpyDatabaseRestore source must reference '$snip'"
+            }
+        } else {
+            Write-Host ("  OK  restore source references '{0}'" -f $snip)
+        }
+    }
+
+    # Manifest exports the three new helpers so callers / tests can invoke them.
+    foreach ($fn in 'Format-SqlCpyByteSize','Get-SqlCpyRestoreStagingFreeSpace','Test-SqlCpyRestoreStagingDiskSpace') {
+        if ($manifest -and $manifest.FunctionsToExport -notcontains $fn) {
+            $failures += [pscustomobject]@{
+                File   = $manifestPath
+                Errors = "FunctionsToExport missing: $fn"
+            }
+        } else {
+            Write-Host "  OK  manifest exports $fn"
+        }
+    }
+} catch {
+    $failures += [pscustomobject]@{
+        File   = 'DatabaseRestore disk-space tests'
+        Errors = $_.Exception.Message
+    }
+}
+
+Write-Host ''
 if ($failures.Count -eq 0) {
     Write-Host 'All syntax and config checks passed.' -ForegroundColor Green
     exit 0

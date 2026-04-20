@@ -685,3 +685,65 @@ Design decisions:
   that grant. If the correct fix is to give the SQL Server service
   account read access to the hidden share, do that and set
   DatabaseRestoreUseLocalStaging = $false in local.psd1.
+
+Disk-space precheck for local staging
+-------------------------------------
+
+Problem: Copy-Item to a staging path on a drive without enough free space
+fails mid-way and leaves a truncated .bak that the restore will then pick
+up and fail on (or worse, silently corrupt the recovery). A follow-up
+report from the user asked for an explicit precheck.
+
+Solution: before each staged copy, Invoke-SqlCpyDatabaseRestore now
+  1. reads the backup file size from the selected candidate (.Length),
+  2. reads free / total space on the staging drive via
+     [System.IO.DriveInfo] (resolved from
+     [System.IO.Path]::GetPathRoot(DatabaseRestoreLocalStagingPath)),
+  3. stat's the staging destination path for an existing file and takes
+     its size too, and
+  4. compares (backup - reclaim) against free bytes, where "reclaim" is
+     the existing staged file's size when DatabaseRestoreOverwriteStagedFile
+     is $true (else 0).
+
+If free < needed, the database is logged with a WARN of the form
+"INSUFFICIENT DISK SPACE on staging drive [C:\]: backup is 2.10 GB ...
+but only 1.00 GB ... free. Skipping this database." and the loop moves
+on to the next database. The copy / restore for that database is NOT
+attempted.
+
+Why skip rather than halve the copy / attempt anyway:
+- Copy-Item -Force mid-fail leaves a truncated file that downstream
+  RESTORE FILELISTONLY / RESTORE DATABASE will try to read, producing
+  a confusing secondary error chain.
+- The failure mode should be loud and obviously about disk space, not
+  about backup headers.
+
+Why the reclaim logic is a simplification:
+- Copy-Item -Force deletes-then-writes, so the transient free-space
+  figure during the copy can dip below the precheck number momentarily.
+  For a precheck that is acceptable: the goal is to avoid launching a
+  copy into a drive that cannot possibly fit the source, not to model
+  every filesystem intermediate state. If this turns out to matter in
+  practice, add a safety factor (e.g. require free >= needed + 5%).
+
+Graceful degradation:
+- UNC staging paths: [System.IO.DriveInfo] cannot query a UNC root
+  portably from PowerShell; free-space reading returns Reason='unc-path'
+  and the precheck proceeds with HasEnoughSpace=$true (logged as
+  "disk-space check incomplete"). This matches the spirit of "local
+  staging only" - if the user has configured a UNC staging path, they
+  have opted out of the workaround.
+- Unknown backup size (.Length absent or 0): HasEnoughSpace=$true with
+  Reason='unknown-size'. Skipping a restore over a missing size is
+  worse than attempting the copy and letting it fail loudly.
+- Missing drive / DriveInfo errors: logged with the raw exception
+  message; the precheck does not skip the database.
+
+The arithmetic lives in Test-SqlCpyRestoreStagingDiskSpace so it can be
+unit-tested with raw byte counts, no SQL Server, no real filesystem. The
+free-space lookup lives in Get-SqlCpyRestoreStagingFreeSpace so the
+DriveInfo call has a single entry point and a stable reason-code
+vocabulary (ok, empty-path, no-root, unc-path, drive-not-found,
+drive-not-ready, error). Human-readable byte sizes come from
+Format-SqlCpyByteSize, which uses binary prefixes (1024) to match
+Windows Explorer's own display.

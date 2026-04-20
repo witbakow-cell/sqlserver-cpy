@@ -301,7 +301,17 @@ consumes them.
   failed copy for one database is non-fatal; the loop continues.
   `DatabaseRestoreCleanupLocalStaging` controls whether the staged file
   is removed after a successful restore; a failed restore never
-  triggers cleanup.
+  triggers cleanup. Before each staged copy runs a disk-space precheck:
+  the backup file size and the free / total space on the staging drive
+  are logged in human-readable form and raw bytes, and if the drive
+  cannot fit the backup the database is logged with an explicit
+  `INSUFFICIENT DISK SPACE` WARN line and skipped (the loop continues
+  with the next database). When `DatabaseRestoreOverwriteStagedFile =
+  $true` the existing staged file's size is subtracted from the needed
+  figure so same-sized overwrites do not spuriously trigger the warning.
+  UNC staging paths and missing file sizes degrade to
+  "check incomplete" and proceed without a guarantee rather than
+  skipping. The precheck also runs in `DryRun`.
 - **`Get-SqlCpyDatabaseRestoreConfig`** — Pure helper that normalises
   restore-related config keys with defaults, including the default UNC
   path, the default extension list (`.bak`, `.backup`), the restore
@@ -359,6 +369,31 @@ consumes them.
   `Invoke-SqlCpyDatabaseRestore` when `DatabaseRestoreUseLocalStaging`
   is `$true` to work around the SQL Server service account not being
   able to read hidden UNC shares.
+- **`Format-SqlCpyByteSize`** — Pure formatter. Converts a byte count
+  (`[long]`, `[int]`, `[double]`, or `$null`) to a human-readable string
+  using binary prefixes (1024) so the output matches Windows Explorer's
+  own disk-space display (`512 B`, `1.00 KB`, `2.10 GB`). Negative or
+  unparseable input maps to `<unknown>`. Used by the disk-space
+  precheck log lines. Unit-tested.
+- **`Get-SqlCpyRestoreStagingFreeSpace`** — Reads available / total free
+  space for the drive that backs a local staging path via
+  `[System.IO.DriveInfo]`, resolved from
+  `[System.IO.Path]::GetPathRoot(Path)`. Does not require the path
+  itself to exist, only the drive root. Never throws. Returns a
+  pscustomobject with `IsAvailable`, `FreeBytes`, `TotalBytes`,
+  pre-formatted `FreeDisplay` / `TotalDisplay`, the resolved `Root`, and
+  a reason code (`ok`, `empty-path`, `no-root`, `unc-path`,
+  `drive-not-found`, `drive-not-ready`, `error`). UNC paths are declared
+  unsupported rather than guessed at. Unit-tested.
+- **`Test-SqlCpyRestoreStagingDiskSpace`** — Pure arithmetic helper.
+  Compares a backup file size against free-space and an optional
+  existing staged file size (reclaimed when
+  `DatabaseRestoreOverwriteStagedFile = $true`). Returns a
+  pscustomobject with `HasEnoughSpace`, a reason code (`ok`,
+  `insufficient`, `unknown-size`, `missing-free`), and pre-formatted
+  needed / free displays. Missing sizes degrade to `HasEnoughSpace =
+  $true` rather than blocking a restore over a missing reading. Runs
+  with no filesystem or SQL Server. Unit-tested.
 
 ## Planned (not in this scaffold)
 

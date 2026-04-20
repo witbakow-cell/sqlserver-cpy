@@ -73,6 +73,9 @@
         'Resolve-SqlCpyRestoreDatabaseAlias'
         'Get-SqlCpyRestoreBackupTimestamp'
         'Get-SqlCpyRestoreStagingPlan'
+        'Format-SqlCpyByteSize'
+        'Get-SqlCpyRestoreStagingFreeSpace'
+        'Test-SqlCpyRestoreStagingDiskSpace'
     )
     CmdletsToExport   = @()
     VariablesToExport = @()
